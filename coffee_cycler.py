@@ -35,6 +35,7 @@ import threading
 import time
 import json
 import os
+from typing import Optional
 
 import serial
 import serial.tools.list_ports
@@ -127,8 +128,8 @@ class SerialDevice:
 # =============================================================================
 class DeviceManager:
     def __init__(self):
-        self.dispenser: SerialDevice | None = None
-        self.front:     SerialDevice | None = None
+        self.dispenser: Optional[SerialDevice] = None
+        self.front:     Optional[SerialDevice] = None
         self._saved: dict = self._load_config()
 
     def _load_config(self) -> dict:
@@ -150,7 +151,7 @@ class DeviceManager:
         except Exception:
             pass
 
-    def _probe(self, port: str) -> str | None:
+    def _probe(self, port: str) -> Optional[str]:
         try:
             s = serial.Serial(port, BAUD_RATE, timeout=1.0)
             _wait_for_ready(s)
@@ -230,7 +231,7 @@ class CycleRunner:
     def _is_color_error(self, r, g, b) -> bool:
         return r >= COLOR_ERR_MIN_R and r > g * COLOR_ERR_R_OVER_G and r > b * COLOR_ERR_R_OVER_B
 
-    def _classify_ring_color(self, r, g, b) -> str | None:
+    def _classify_ring_color(self, r, g, b) -> Optional[str]:
         if g >= RING_GREEN_MIN_G and g > r * RING_GREEN_G_OVER_R and g > b * RING_GREEN_G_OVER_B:
             return "green"
         if b > r * RING_WARN_BLUE_B_OVER_R and b > g * RING_WARN_BLUE_B_OVER_G:
@@ -377,11 +378,11 @@ class CoffeeCyclerApp:
         self.ring_timeout_var   = tk.IntVar(value=DEFAULT_RING_TIMEOUT_S)
         self.maint_interval_var = tk.IntVar(value=50)
         self.current_cycle    = 0
-        self.cycle_thread: threading.Thread | None = None
+        self.cycle_thread: Optional[threading.Thread] = None
         self.stop_flag        = threading.Event()
         self._maintenance_resume = threading.Event()
         self._maintenance_resume.set()
-        self.start_time: float | None = None
+        self.start_time: Optional[float] = None
 
         # Pendant state
         # Items: (kind, widget, var, lo, hi, label)
@@ -506,7 +507,7 @@ class CoffeeCyclerApp:
             tk.Label(cell, text=label_text, bg=self.PANEL, fg=self.MUTED,
                      font=("Helvetica", 11)).pack(anchor="w")
             entry = ttk.Entry(cell, textvariable=int_var, width=8,
-                              font=("Consolas", 20, "bold"), style="Dark.TEntry",
+                              font=("Courier", 20, "bold"), style="Dark.TEntry",
                               justify="right")
             entry.pack(fill="x", pady=(4, 0), ipady=8)
             return entry
@@ -1175,7 +1176,7 @@ class CoffeeCyclerApp:
         self.stop_btn.configure(state="disabled")
         self.reconnect_btn.configure(state="normal")
 
-    def _update_ui(self, cycle: str | None = None, step: tuple | None = None):
+    def _update_ui(self, cycle: Optional[str] = None, step: Optional[tuple] = None):
         def apply():
             if cycle is not None:
                 self.cycle_value.set(cycle)
