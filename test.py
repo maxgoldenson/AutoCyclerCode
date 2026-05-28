@@ -18,6 +18,7 @@ class KeyboardApp:
         self.title_label.pack(pady=20)
 
         # Main interactive status box
+        
         self.status_box = tk.Label(
             root, 
             text="READY", 

@@ -467,24 +467,8 @@ class CoffeeCyclerApp:
     #  UI construction
     # -------------------------------------------------------------------------
     def _build_ui(self):
-        # Scrollable canvas so content works at any resolution
-        canvas = tk.Canvas(self.root, bg=self.BG, highlightthickness=0)
-        vsb    = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        outer = tk.Frame(canvas, bg=self.BG)
-        win_id = canvas.create_window((0, 0), window=outer, anchor="nw")
-
-        def _on_canvas_resize(event):
-            canvas.itemconfig(win_id, width=event.width)
-        def _on_frame_resize(_event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        canvas.bind("<Configure>", _on_canvas_resize)
-        outer.bind("<Configure>",  _on_frame_resize)
-        canvas.bind_all("<MouseWheel>",
-                         lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        outer = tk.Frame(self.root, bg=self.BG)
+        outer.pack(fill="both", expand=True)
 
         # ── Header ──────────────────────────────────────────────────────────
         hdr = tk.Frame(outer, bg=self.BG)
