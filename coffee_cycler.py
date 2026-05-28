@@ -474,7 +474,7 @@ class CoffeeCyclerApp:
         # ── Header ──────────────────────────────────────────────────────────
         hdr = tk.Frame(outer, bg=self.BG)
         hdr.pack(fill="x", padx=32, pady=(28, 0))
-        tk.Label(hdr, text="Coffee Auto Cycler", bg=self.BG, fg=self.TEXT,
+        tk.Label(hdr, text="BrewBird Auto Cycler", bg=self.BG, fg=self.TEXT,
                  font=("Helvetica", 26, "bold"), anchor="w").pack(side="left")
         self.conn_var   = tk.StringVar(value="Scanning for devices...")
         self.conn_label = tk.Label(hdr, textvariable=self.conn_var,
