@@ -405,7 +405,7 @@ class CoffeeCyclerApp:
     #  Window / styles
     # -------------------------------------------------------------------------
     def _setup_window(self):
-        self.root.title("Coffee Auto Cycler")
+        self.root.title("BrewBird Auto Cycler")
         self.root.configure(bg=self.BG)
         self.root.attributes("-fullscreen", True)
         # Escape exits fullscreen (useful during development)
