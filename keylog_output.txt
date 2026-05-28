@@ -1,0 +1,9 @@
+keysym='slash'               char='/'     keycode=111
+keysym='asterisk'            char='*'     keycode=106
+keysym='plus'                char='+'     keycode=107
+keysym='minus'               char='-'     keycode=109
+keysym='Return'              char='\r'    keycode=13
+keysym='8'                   char='8'     keycode=104
+keysym='2'                   char='2'     keycode=98
+keysym='4'                   char='4'     keycode=100
+keysym='6'                   char='6'     keycode=102
