@@ -35,13 +35,20 @@ import threading
 import time
 import json
 import os
+import datetime
 from typing import Optional
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _PACIFIC = _ZoneInfo("America/Los_Angeles")
+except Exception:
+    _PACIFIC = datetime.timezone(datetime.timedelta(hours=-7))  # PDT fallback
 
 import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-01 16:35"
+VERSION = "2026-06-01 16:47"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -260,8 +267,40 @@ class CycleRunner:
         self.ring_wait_min   = ring_wait_min
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
-        self._green_seen  = False  # True once a green flash has been observed this run
-        self._cycle_count = 0      # incremented at the start of each run_one call
+        self._green_seen  = False
+        self._cycle_count = 0
+        self._green_times: list = []  # wall-clock timestamps of each green flash
+
+    @property
+    def mean_cycle_s(self) -> float:
+        """Mean seconds between green flashes. Returns 90 until 2+ greens observed."""
+        if len(self._green_times) < 2:
+            return 90.0
+        intervals = [self._green_times[i] - self._green_times[i - 1]
+                     for i in range(1, len(self._green_times))]
+        return sum(intervals) / len(intervals)
+
+    def _wait_for_blue(self, stop_flag, status_cb, timeout: int = 120) -> bool:
+        """Poll ring until blue (machine idle/ready) is seen or timeout.
+        Returns False only if stop was requested; timeout proceeds silently."""
+        f = self.dev.front
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if stop_flag.is_set():
+                return False
+            status_cb(4, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
+            resp = f.send("GET COLOR RING", expect="RGB:")
+            if resp.startswith("RGB:"):
+                try:
+                    r, g, b = (int(x) for x in resp[4:].split(","))
+                    color = self._classify_ring_color(r, g, b)
+                    print(f"[blue-wait] R={r} G={g} B={b} -> {color}")
+                    if color == "blue":
+                        return True
+                except ValueError:
+                    pass
+        print(f"[blue-wait] no blue after {timeout}s, proceeding")
+        return True
 
     def _is_color_error(self, r, g, b) -> bool:
         return r >= COLOR_ERR_MIN_R and r > g * COLOR_ERR_R_OVER_G and r > b * COLOR_ERR_R_OVER_B
