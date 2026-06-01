@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-01 16:47"
+VERSION = "2026-06-01 17:43"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,11 +92,12 @@ CAP_PULSE_S             = 0.5
 
 # -- Pre-start checklist -------------------------------------------------------
 PRESTART_CHECKS = [
-    "Water reservoir is full",
-    "Drip tray is empty",
-    "Portafilter is locked in",
-    "Bean hopper has beans",
-    "Waste container in position",
+    "Machine set to pass through",
+    "External compost bin is empty and in place",
+    "Coffee out tube and bucket are connected",
+    "Dispensor tube is installed in the machine",
+    "Front assembly is installed on the machine",
+    "Clear and ready to start cycles",
 ]
 
 
@@ -352,6 +353,7 @@ class CycleRunner:
 
             if color == "green":
                 self._green_seen = True
+                self._green_times.append(time.time())
                 return "green", f"R={r} G={g} B={b}"
 
             if color == "blue":
@@ -383,6 +385,9 @@ class CycleRunner:
     def run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
         self._cycle_count += 1
         d, f = self.dev.dispenser, self.dev.front
+
+        # Guarantee CAP is high-impedance at the start of every cycle
+        f.send("SET CAP OFF", expect="CAP:")
 
         status_cb(1, "Checking error light...")
         t0   = time.time()
@@ -419,11 +424,10 @@ class CycleRunner:
         resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
 
-        # Explicit 1-second settle after gate is fully closed before cap touch is
-        # allowed to activate — CAP must remain high impedance until this point.
+        # Gate settle — 1 s gap, then poll until machine shows blue (idle/ready).
+        # CAP stays high-impedance throughout.
         if not _sleep(1.0, stop_flag): return False, "Stopped"
-        status_cb(3, "Gate closed -- settling before brew trigger")
-        if not _sleep(1.0, stop_flag): return False, "Stopped"
+        if not self._wait_for_blue(stop_flag, status_cb): return False, "Stopped"
 
         resp_cap = f.send("SET CAP ON", expect="CAP:")
         trigger_time = time.time()
@@ -483,8 +487,10 @@ class CoffeeCyclerApp:
         self._maintenance_resume = threading.Event()
         self._maintenance_resume.set()
         self.start_time: Optional[float] = None
+        self.runner: Optional[object] = None   # live CycleRunner, used by _tick for adaptive ETA
 
         # Pendant state
+        self._pend_labels: dict = {}           # idx → tk.Label whose fg turns green when focused
         # Items: (kind, widget, var, lo, hi, label)
         #   kind  'entry' | 'button' | 'checkbox'
         #   var   IntVar (entry) | None (button) | BooleanVar (checkbox)
@@ -536,7 +542,7 @@ class CoffeeCyclerApp:
                          font=("Helvetica", 12), wraplength=900)
         style.configure("StepDetail.TLabel", background=self.PANEL, foreground=self.MUTED,
                          font=("Helvetica", 12), wraplength=600)
-        style.configure("PendFocus.TLabel",  background=self.PANEL, foreground=self.ACCENT,
+        style.configure("PendFocus.TLabel",  background=self.PANEL, foreground=self.SUCCESS,
                          font=("Helvetica", 14, "bold"))
         style.configure("PendHint.TLabel",   background=self.PANEL, foreground=self.MUTED,
                          font=("Helvetica", 11))
@@ -602,22 +608,24 @@ class CoffeeCyclerApp:
         grid_cfg.columnconfigure(0, weight=1, uniform="cfg")
         grid_cfg.columnconfigure(1, weight=1, uniform="cfg")
 
-        def _cfg_cell(parent, label_text, int_var, r, c):
+        def _cfg_cell(parent, label_text, int_var, r, c, pend_idx):
             cell = tk.Frame(parent, bg=self.PANEL)
             cell.grid(row=r, column=c, sticky="ew", padx=(0, 16) if c == 0 else 0,
                       pady=(0, 12))
-            tk.Label(cell, text=label_text, bg=self.PANEL, fg=self.MUTED,
-                     font=("Helvetica", 11)).pack(anchor="w")
+            lbl = tk.Label(cell, text=label_text, bg=self.PANEL, fg=self.MUTED,
+                           font=("Helvetica", 11))
+            lbl.pack(anchor="w")
+            self._pend_labels[pend_idx] = lbl   # turns green when this field is focused
             entry = ttk.Entry(cell, textvariable=int_var, width=8,
                               font=("Courier", 20, "bold"), style="Dark.TEntry",
                               justify="right")
             entry.pack(fill="x", pady=(4, 0), ipady=8)
             return entry
 
-        self.cycles_entry       = _cfg_cell(grid_cfg, "Number of cycles",      self.total_cycles,      0, 0)
-        self.ring_min_entry     = _cfg_cell(grid_cfg, "Ring wait minimum (s)",  self.ring_wait_min_var, 0, 1)
-        self.ring_timeout_entry = _cfg_cell(grid_cfg, "Ring timeout (s)",       self.ring_timeout_var,  1, 0)
-        self.maint_entry        = _cfg_cell(grid_cfg, "Maintenance every N cycles", self.maint_interval_var, 1, 1)
+        self.cycles_entry       = _cfg_cell(grid_cfg, "Number of cycles",           self.total_cycles,       0, 0, 0)
+        self.ring_min_entry     = _cfg_cell(grid_cfg, "Ring wait minimum (s)",       self.ring_wait_min_var,  0, 1, 1)
+        self.ring_timeout_entry = _cfg_cell(grid_cfg, "Ring timeout (s)",            self.ring_timeout_var,   1, 0, 2)
+        self.maint_entry        = _cfg_cell(grid_cfg, "Maintenance every N cycles",  self.maint_interval_var, 1, 1, 3)
 
         # ── Pendant indicator ────────────────────────────────────────────────
         pend = self._panel(outer)
@@ -639,12 +647,13 @@ class CoffeeCyclerApp:
 
         stat_grid = tk.Frame(stat, bg=self.PANEL)
         stat_grid.pack(fill="x", pady=(0, 16))
-        for c in range(3):
+        for c in range(4):
             stat_grid.columnconfigure(c, weight=1, uniform="stat")
 
         self.cycle_value   = self._stat_cell(stat_grid, "CYCLE",          "0 / 0",  0)
         self.elapsed_value = self._stat_cell(stat_grid, "ELAPSED",        "00:00",  1)
         self.eta_value     = self._stat_cell(stat_grid, "EST. REMAINING", "--",      2)
+        self.done_at_value = self._stat_cell(stat_grid, "DONE BY",        "--",      3)
 
         step_row = tk.Frame(stat, bg=self.PANEL)
         step_row.pack(fill="x", pady=(0, 10))
@@ -692,7 +701,7 @@ class CoffeeCyclerApp:
 
     def _stat_cell(self, parent, label, value, col) -> tk.StringVar:
         cell = tk.Frame(parent, bg=self.PANEL, padx=8, pady=8)
-        cell.grid(row=0, column=col, sticky="nsew", padx=(0, 16) if col < 2 else 0)
+        cell.grid(row=0, column=col, sticky="nsew", padx=(0, 16) if col < 3 else 0)
         ttk.Label(cell, text=label, style="StatLabel.TLabel").pack(anchor="w")
         var = tk.StringVar(value=value)
         ttk.Label(cell, textvariable=var, style="Stat.TLabel").pack(anchor="w")
@@ -819,6 +828,15 @@ class CoffeeCyclerApp:
         _, widget, *_ = self._pend_items[self._pend_idx]
         widget.focus_set()
         self._pend_update_indicator()
+        self._pend_update_highlight()
+
+    def _pend_update_highlight(self):
+        """Turn the focused field's label green; all others revert to muted."""
+        for i, lbl in self._pend_labels.items():
+            try:
+                lbl.configure(fg=self.SUCCESS if i == self._pend_idx else self.MUTED)
+            except tk.TclError:
+                pass
 
     def _pend_move(self, delta: int):
         n = len(self._pend_items)
@@ -1154,7 +1172,7 @@ class CoffeeCyclerApp:
         dlg.configure(bg=self.PANEL)
         dlg.transient(self.root)
         dlg.grab_set()
-        dlg.geometry("420x320")
+        dlg.geometry("420x400")
 
         tk.Label(dlg, text=f"Maintenance pause after cycle {completed}",
                  bg=self.PANEL, fg=self.TEXT,
@@ -1164,9 +1182,11 @@ class CoffeeCyclerApp:
                  font=("Helvetica", 9)).pack(anchor="w", padx=20, pady=(0, 12))
 
         checks = [
-            "Empty the old coffee from the cup",
-            "Empty the grounds from the portafilter",
-            "Refill the bean hopper",
+            "Empty coffee",
+            "Empty compost",
+            "Coffee in is refilled",
+            "Check for any leaks or major issues",
+            "All is good continue",
         ]
         check_vars    = [tk.BooleanVar(value=False) for _ in checks]
         check_widgets = []
@@ -1205,9 +1225,10 @@ class CoffeeCyclerApp:
             ("checkbox", check_widgets[i], check_vars[i], None, None, checks[i])
             for i in range(len(checks))
         ]
+        # Resume comes first so Enter through checkboxes lands on Resume, not Stop
         pend_items += [
-            ("button", stop_btn,   None, None, None, "Stop Run"),
             ("button", resume_btn, None, None, None, "Resume"),
+            ("button", stop_btn,   None, None, None, "Stop Run"),
         ]
         self._pend_push_context(pend_items, start_idx=0)
 
@@ -1219,6 +1240,7 @@ class CoffeeCyclerApp:
         runner = CycleRunner(self.devices, ring_wait_min=ring_wait_min,
                              ring_timeout=ring_timeout,
                              ring_warning_cb=self._show_ring_warning_dialog)
+        self.runner = runner
         try:
             for i in range(1, total + 1):
                 if self.stop_flag.is_set(): break
@@ -1337,13 +1359,21 @@ class CoffeeCyclerApp:
         if self.start_time and self.cycle_thread and self.cycle_thread.is_alive():
             elapsed = int(time.time() - self.start_time)
             self.elapsed_value.set(self._fmt_time(elapsed))
-            total         = int(self.total_cycles.get())
-            ring_wait_min = int(self.ring_wait_min_var.get())
-            cycle_secs    = 6 + ring_wait_min
-            total_seconds = total * cycle_secs
-            remaining     = max(total_seconds - elapsed, 0)
+
+            total = int(self.total_cycles.get())
+            # Adaptive cycle time: use runner's measured mean once 2+ greens seen,
+            # otherwise fall back to 90 s per cycle.
+            cycle_secs = self.runner.mean_cycle_s if self.runner else 90.0
+            remaining_cycles = max(0, total - self.current_cycle)
+            remaining = int(remaining_cycles * cycle_secs)
             self.eta_value.set(self._fmt_time(remaining))
-            pct = min(100, (elapsed / total_seconds) * 100) if total_seconds else 0
+
+            # "Done by" clock in Pacific time (San Carlos, CA)
+            done_dt = datetime.datetime.now(tz=_PACIFIC) + datetime.timedelta(seconds=remaining)
+            self.done_at_value.set(done_dt.strftime("%-I:%M %p"))
+
+            total_secs = total * cycle_secs
+            pct = min(100, (elapsed / total_secs) * 100) if total_secs else 0
             self.progress["value"] = pct
         self.root.after(250, self._tick)
 
