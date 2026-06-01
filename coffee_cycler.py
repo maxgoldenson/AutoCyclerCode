@@ -41,7 +41,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-01 16:15"
+VERSION = "2026-06-01 16:35"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -108,7 +108,14 @@ def _wait_for_ready(ser: serial.Serial, timeout: float = BOOT_TIMEOUT) -> bool:
 class SerialDevice:
     def __init__(self, port: str, baud: int = BAUD_RATE, timeout: float = CMD_TIMEOUT):
         self.port = port
-        self._ser = serial.Serial(port, baud, timeout=1.0)
+        self._ser = serial.Serial(
+            port, baud,
+            timeout=1.0,
+            write_timeout=5.0,
+            dsrdtr=False,    # don't toggle DTR — prevents spurious resets on some Pi USB ports
+            rtscts=False,    # disable hardware flow control — not needed and causes issues on some chips
+        )
+        time.sleep(0.1)      # let USB-serial enumeration settle before first byte
         _wait_for_ready(self._ser)
         self._ser.timeout = timeout
         self._ser.reset_input_buffer()
@@ -273,17 +280,15 @@ class CycleRunner:
 
     def _wait_for_ring(self, trigger_time, stop_flag, status_cb) -> tuple[str, str]:
         """
-        Two-phase ring poll:
-          Phase 1 — poll for green flash (brew complete).
-          Phase 2 — after green, poll for blue ring (machine ready).
-        Returns "green" (proceed) when blue is confirmed after green, or on
-        cycle 1 when blue appears before green (machine was already idle).
-        Returns "timeout" if neither phase completes within ring_timeout.
+        Poll for the green brew-complete flash.
+        Green  → return immediately so the dispenser can start the next cycle.
+        Blue before green → always a warning (machine idle without having brewed).
+        Orange / yellow   → warning.
+        Timeout           → proceed anyway.
         """
         min_end     = trigger_time + self.ring_wait_min
         timeout_end = trigger_time + self.ring_timeout
         f = self.dev.front
-        green_this_cycle = False
 
         while time.time() < min_end:
             if stop_flag.is_set(): return "stopped", "Stopped"
@@ -292,11 +297,7 @@ class CycleRunner:
 
         while time.time() < timeout_end:
             if stop_flag.is_set(): return "stopped", "Stopped"
-
-            if green_this_cycle:
-                status_cb(5, f"Brew done, waiting for blue ready -- {int(timeout_end - time.time())}s")
-            else:
-                status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
+            status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
 
             resp = f.send("GET COLOR RING", expect="RGB:")
             print(f"[serial] GET COLOR RING -> {resp!r}")
@@ -311,21 +312,17 @@ class CycleRunner:
             print(f"[ring]   R={r} G={g} B={b}  -> {color}")
 
             if color == "green":
-                green_this_cycle = True
-                self._green_seen  = True
-                # Keep polling — still need blue to confirm machine is ready
+                self._green_seen = True
+                return "green", f"R={r} G={g} B={b}"
 
-            elif color == "blue":
-                if green_this_cycle or self._cycle_count == 1:
-                    # Blue after green = machine ready; or cycle 1 = already idle
-                    return "green", f"Blue ready ring (R={r} G={g} B={b})"
-                # Blue before green on cycle 2+ is unexpected
+            if color == "blue":
+                # Blue before green always means the machine didn't brew
                 return "warning:blue", f"Blue ring before green (R={r} G={g} B={b})"
 
-            elif color in ("orange", "yellow"):
+            if color in ("orange", "yellow"):
                 return f"warning:{color}", f"{color.title()} ring (R={r} G={g} B={b})"
 
-        return "timeout", f"No blue ready signal after {self.ring_timeout}s"
+        return "timeout", f"No green flash after {self.ring_timeout}s"
 
     def _do_cap_reset(self, stop_flag, status_cb) -> bool:
         f = self.dev.front
@@ -378,11 +375,16 @@ class CycleRunner:
         resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
         if not _sleep(1.0, stop_flag): return False, "Stopped"
+
         status_cb(3, "Closing gate...")
         resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
-        if not self._step(3, "Gate closed", status_cb, stop_flag, elapsed=1.0):
-            return False, "Stopped"
+
+        # Explicit 1-second settle after gate is fully closed before cap touch is
+        # allowed to activate — CAP must remain high impedance until this point.
+        if not _sleep(1.0, stop_flag): return False, "Stopped"
+        status_cb(3, "Gate closed -- settling before brew trigger")
+        if not _sleep(1.0, stop_flag): return False, "Stopped"
 
         resp_cap = f.send("SET CAP ON", expect="CAP:")
         trigger_time = time.time()
@@ -1211,10 +1213,49 @@ class CoffeeCyclerApp:
     #  UI state helpers
     # =========================================================================
     def _on_stop(self):
-        if not messagebox.askyesno("Stop cycle",
-                                   "Are you sure you want to stop the current run?"):
-            return
-        self.stop_flag.set()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Stop Run")
+        dlg.configure(bg=self.PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("400x200")
+
+        tk.Label(dlg, text="Stop the current run?",
+                 bg=self.PANEL, fg=self.TEXT,
+                 font=("Helvetica", 14, "bold")).pack(anchor="w", padx=24, pady=(24, 8))
+        tk.Label(dlg, text="The machine will finish its current step then halt.",
+                 bg=self.PANEL, fg=self.MUTED,
+                 font=("Helvetica", 11)).pack(anchor="w", padx=24, pady=(0, 20))
+
+        confirmed = {"stop": False}
+
+        def do_stop():
+            confirmed["stop"] = True
+            self._pend_pop_context()
+            dlg.destroy()
+
+        def do_cancel():
+            self._pend_pop_context()
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=self.PANEL)
+        btn_row.pack(fill="x", padx=24, side="bottom", pady=16)
+        cancel_btn = ttk.Button(btn_row, text="Cancel",   style="Small.TButton",
+                                command=do_cancel)
+        stop_btn   = ttk.Button(btn_row, text="Stop Run", style="Danger.TButton",
+                                command=do_stop)
+        cancel_btn.pack(side="left")
+        stop_btn.pack(side="right")
+
+        self._pend_push_context([
+            ("button", stop_btn,   None, None, None, "Stop Run"),
+            ("button", cancel_btn, None, None, None, "Cancel"),
+        ], start_idx=0)
+
+        self.root.wait_window(dlg)
+        if confirmed["stop"]:
+            self.stop_flag.set()
+            self._set_status("Stopping...", self.WARNING)
         self._set_status("Stopping...", self.WARNING)
 
     def _on_finished(self, stopped: bool):
