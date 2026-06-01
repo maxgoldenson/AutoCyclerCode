@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"c:\\Users\\Max Goldenson\\Documents\\AutoCyclerCode\\update_version.py\"",
+            "statusMessage": "Updating version stamp..."
+          }
+        ]
+      }
+    ]
+  }
+}

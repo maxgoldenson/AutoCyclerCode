@@ -40,6 +40,9 @@ from typing import Optional
 import serial
 import serial.tools.list_ports
 
+# -- Version -------------------------------------------------------------------
+VERSION = "2026-06-01"
+
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_DIR, "autocycler_config.json")
@@ -110,10 +113,33 @@ class SerialDevice:
         self._ser.timeout = timeout
         self._ser.reset_input_buffer()
 
-    def send(self, cmd: str) -> str:
-        self._ser.reset_input_buffer()
-        self._ser.write((cmd + "\n").encode())
-        return self._ser.readline().decode("utf-8", errors="replace").strip()
+    def send(self, cmd: str, expect: str = None, retries: int = 2) -> str:
+        """
+        Send cmd and return the response line.
+        If expect is given, any line that doesn't start with it is discarded as
+        garbage and reading continues.  The full send+read cycle is retried up to
+        `retries` times before giving up.
+        """
+        timeout = self._ser.timeout or CMD_TIMEOUT
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(0.3)
+            self._ser.reset_input_buffer()
+            self._ser.write((cmd + "\n").encode())
+            self._ser.flush()
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                raw = self._ser.readline()
+                if not raw:
+                    break  # readline timed out — try next attempt
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue  # blank line — keep draining
+                if expect is None or line.startswith(expect):
+                    return line
+                print(f"[serial] discard garbage ({cmd!r}): {line!r}")
+            print(f"[serial] no valid response, attempt {attempt + 1}/{retries + 1}: {cmd!r}")
+        return ""
 
     def close(self):
         try:
@@ -227,6 +253,8 @@ class CycleRunner:
         self.ring_wait_min   = ring_wait_min
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
+        self._green_seen  = False  # True once a green flash has been observed this run
+        self._cycle_count = 0      # incremented at the start of each run_one call
 
     def _is_color_error(self, r, g, b) -> bool:
         return r >= COLOR_ERR_MIN_R and r > g * COLOR_ERR_R_OVER_G and r > b * COLOR_ERR_R_OVER_B
@@ -244,39 +272,69 @@ class CycleRunner:
         return None
 
     def _wait_for_ring(self, trigger_time, stop_flag, status_cb) -> tuple[str, str]:
+        """
+        Two-phase ring poll:
+          Phase 1 — poll for green flash (brew complete).
+          Phase 2 — after green, poll for blue ring (machine ready).
+        Returns "green" (proceed) when blue is confirmed after green, or on
+        cycle 1 when blue appears before green (machine was already idle).
+        Returns "timeout" if neither phase completes within ring_timeout.
+        """
         min_end     = trigger_time + self.ring_wait_min
         timeout_end = trigger_time + self.ring_timeout
         f = self.dev.front
+        green_this_cycle = False
+
         while time.time() < min_end:
             if stop_flag.is_set(): return "stopped", "Stopped"
-            status_cb(5, f"Waiting for machine -- {int(timeout_end - time.time())}s remaining")
+            status_cb(5, f"Waiting minimum -- {int(timeout_end - time.time())}s remaining")
             time.sleep(0.1)
+
         while time.time() < timeout_end:
             if stop_flag.is_set(): return "stopped", "Stopped"
-            status_cb(5, f"Polling ring -- {int(timeout_end - time.time())}s remaining")
-            resp = f.send("GET COLOR RING")
+
+            if green_this_cycle:
+                status_cb(5, f"Brew done, waiting for blue ready -- {int(timeout_end - time.time())}s")
+            else:
+                status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
+
+            resp = f.send("GET COLOR RING", expect="RGB:")
             print(f"[serial] GET COLOR RING -> {resp!r}")
-            if resp.startswith("RGB:"):
-                try:
-                    r, g, b = (int(x) for x in resp[4:].split(","))
-                    color = self._classify_ring_color(r, g, b)
-                    print(f"[ring]   R={r} G={g} B={b}  -> {color}")
-                    if color == "green":
-                        return "green", f"R={r} G={g} B={b}"
-                    if color in ("orange", "yellow", "blue"):
-                        return f"warning:{color}", f"{color.title()} ring (R={r} G={g} B={b})"
-                except ValueError:
-                    pass
-        return "timeout", f"No green flash after {self.ring_timeout}s"
+            if not resp.startswith("RGB:"):
+                continue
+            try:
+                r, g, b = (int(x) for x in resp[4:].split(","))
+            except ValueError:
+                continue
+
+            color = self._classify_ring_color(r, g, b)
+            print(f"[ring]   R={r} G={g} B={b}  -> {color}")
+
+            if color == "green":
+                green_this_cycle = True
+                self._green_seen  = True
+                # Keep polling — still need blue to confirm machine is ready
+
+            elif color == "blue":
+                if green_this_cycle or self._cycle_count == 1:
+                    # Blue after green = machine ready; or cycle 1 = already idle
+                    return "green", f"Blue ready ring (R={r} G={g} B={b})"
+                # Blue before green on cycle 2+ is unexpected
+                return "warning:blue", f"Blue ring before green (R={r} G={g} B={b})"
+
+            elif color in ("orange", "yellow"):
+                return f"warning:{color}", f"{color.title()} ring (R={r} G={g} B={b})"
+
+        return "timeout", f"No blue ready signal after {self.ring_timeout}s"
 
     def _do_cap_reset(self, stop_flag, status_cb) -> bool:
         f = self.dev.front
         status_cb(5, "Resetting -- holding trigger 10s...")
-        f.send("SET CAP ON")
+        f.send("SET CAP ON", expect="CAP:")
         if not _sleep(10.0, stop_flag):
-            f.send("SET CAP OFF")
+            f.send("SET CAP OFF", expect="CAP:")
             return False
-        f.send("SET CAP OFF")
+        f.send("SET CAP OFF", expect="CAP:")
         status_cb(5, "Resetting -- waiting 30s...")
         return _sleep(30.0, stop_flag)
 
@@ -287,11 +345,12 @@ class CycleRunner:
         return _sleep(hold, stop_flag)
 
     def run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
+        self._cycle_count += 1
         d, f = self.dev.dispenser, self.dev.front
 
         status_cb(1, "Checking error light...")
         t0   = time.time()
-        resp = f.send("GET COLOR ERROR")
+        resp = f.send("GET COLOR ERROR", expect="RGB:")
         print(f"[serial] GET COLOR ERROR -> {resp!r}")
         elapsed = time.time() - t0
         if not resp.startswith("RGB:"):
@@ -307,7 +366,7 @@ class CycleRunner:
 
         status_cb(2, "Dispensing ~19 g...")
         t0   = time.time()
-        resp = d.send("SET ANGLE 360")
+        resp = d.send("SET ANGLE 360", expect="ANGLE:")
         print(f"[serial] SET ANGLE 360 -> {resp!r}")
         elapsed = time.time() - t0
         if not resp.startswith("ANGLE:"):
@@ -316,21 +375,23 @@ class CycleRunner:
             return False, "Stopped"
 
         status_cb(3, "Opening gate...")
-        print(f"[serial] SET SERVO {SERVO_OPEN} -> {f.send(f'SET SERVO {SERVO_OPEN}')!r}")
+        resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
+        print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
         if not _sleep(1.0, stop_flag): return False, "Stopped"
         status_cb(3, "Closing gate...")
-        print(f"[serial] SET SERVO {SERVO_REST} -> {f.send(f'SET SERVO {SERVO_REST}')!r}")
+        resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
+        print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
         if not self._step(3, "Gate closed", status_cb, stop_flag, elapsed=1.0):
             return False, "Stopped"
 
-        f.send("SET CAP ON")
+        resp_cap = f.send("SET CAP ON", expect="CAP:")
         trigger_time = time.time()
-        print(f"[serial] SET CAP ON  (pulse {CAP_PULSE_S}s)")
+        print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
         if not _sleep(CAP_PULSE_S, stop_flag):
-            f.send("SET CAP OFF")
+            f.send("SET CAP OFF", expect="CAP:")
             return False, "Stopped"
-        f.send("SET CAP OFF")
-        print(f"[serial] SET CAP OFF")
+        resp_cap = f.send("SET CAP OFF", expect="CAP:")
+        print(f"[serial] SET CAP OFF -> {resp_cap!r}")
         if not self._step(4, "Brew triggered", status_cb, stop_flag, elapsed=CAP_PULSE_S):
             return False, "Stopped"
 
@@ -338,11 +399,9 @@ class CycleRunner:
         if outcome == "stopped":
             return False, "Stopped"
         if outcome == "green":
-            status_cb(5, "Green ring -- proceeding")
-            if not _sleep(1.5, stop_flag): return False, "Stopped"
+            status_cb(5, f"Machine ready -- {detail}")
         elif outcome == "timeout":
-            status_cb(5, "Ring timeout -- proceeding")
-            if not _sleep(1.5, stop_flag): return False, "Stopped"
+            status_cb(5, "Ring timeout -- proceeding anyway")
         elif outcome.startswith("warning:"):
             color  = outcome.split(":")[1]
             action = self.ring_warning_cb(color, detail)
@@ -574,6 +633,10 @@ class CoffeeCyclerApp:
         self.stop_btn = ttk.Button(btns, text="Stop", style="Danger.TButton",
                                    command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(16, 0))
+
+        # ── Version stamp (bottom-left) ──────────────────────────────────────
+        tk.Label(outer, text=f"v{VERSION}", bg=self.BG, fg="#475569",
+                 font=("Helvetica", 10)).pack(anchor="w", padx=32, pady=(0, 12))
 
         self._pend_init()
 
