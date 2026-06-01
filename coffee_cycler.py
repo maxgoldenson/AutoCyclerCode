@@ -535,6 +535,8 @@ class CoffeeCyclerApp:
         hdr.pack(fill="x", padx=32, pady=(28, 0))
         tk.Label(hdr, text="BrewBird Auto Cycler", bg=self.BG, fg=self.TEXT,
                  font=("Helvetica", 26, "bold"), anchor="w").pack(side="left")
+        tk.Label(hdr, text=f"v{VERSION}", bg=self.BG, fg=self.SUCCESS,
+                 font=("Helvetica", 14, "bold")).pack(side="left", padx=(16, 0))
         self.conn_var   = tk.StringVar(value="Scanning for devices...")
         self.conn_label = tk.Label(hdr, textvariable=self.conn_var,
                                    bg=self.BG, fg=self.MUTED,
@@ -634,9 +636,6 @@ class CoffeeCyclerApp:
                                    command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(16, 0))
 
-        # ── Version stamp (bottom-left) ──────────────────────────────────────
-        tk.Label(outer, text=f"v{VERSION}", bg=self.BG, fg="#475569",
-                 font=("Helvetica", 10)).pack(anchor="w", padx=32, pady=(0, 12))
 
         self._pend_init()
 
