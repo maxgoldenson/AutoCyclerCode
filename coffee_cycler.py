@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-02 11:33"
+VERSION = "2026-06-02 11:43"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -66,7 +66,7 @@ ID_FRONT     = "FRONT_ASSEMBLY"
 
 # -- Servo angles (0-180 deg) --------------------------------------------------
 SERVO_REST = 95
-SERVO_OPEN = 125
+SERVO_OPEN = 135
 
 # -- Error sensor color thresholds --------------------------------------------
 COLOR_ERR_MIN_R    = 160
@@ -418,7 +418,7 @@ class CycleRunner:
         status_cb(3, "Opening gate...")
         resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
-        if not _sleep(1.0, stop_flag): return False, "Stopped"
+        if not _sleep(3.0, stop_flag): return False, "Stopped"
 
         status_cb(3, "Closing gate...")
         resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
@@ -647,13 +647,14 @@ class CoffeeCyclerApp:
 
         stat_grid = tk.Frame(stat, bg=self.PANEL)
         stat_grid.pack(fill="x", pady=(0, 16))
-        for c in range(4):
+        for c in range(5):
             stat_grid.columnconfigure(c, weight=1, uniform="stat")
 
-        self.cycle_value   = self._stat_cell(stat_grid, "CYCLE",          "0 / 0",  0)
-        self.elapsed_value = self._stat_cell(stat_grid, "ELAPSED",        "00:00",  1)
-        self.eta_value     = self._stat_cell(stat_grid, "EST. REMAINING", "--",      2)
-        self.done_at_value = self._stat_cell(stat_grid, "DONE BY",        "--",      3)
+        self.cycle_value      = self._stat_cell(stat_grid, "CYCLE",          "0 / 0",  0)
+        self.elapsed_value    = self._stat_cell(stat_grid, "ELAPSED",        "00:00",  1)
+        self.eta_value        = self._stat_cell(stat_grid, "EST. REMAINING", "--",      2)
+        self.done_at_value    = self._stat_cell(stat_grid, "DONE BY",        "--",      3)
+        self.mean_cycle_value = self._stat_cell(stat_grid, "MEAN CYCLE",     "--",      4)
 
         step_row = tk.Frame(stat, bg=self.PANEL)
         step_row.pack(fill="x", pady=(0, 10))
@@ -982,6 +983,8 @@ class CoffeeCyclerApp:
         if ok:
             resp = self.devices.front.send(f"SET SERVO {SERVO_REST}")
             print(f"[boot] SET SERVO {SERVO_REST} -> {resp!r}")
+            resp_cap = self.devices.front.send("SET CAP OFF", expect="CAP:")
+            print(f"[boot] SET CAP OFF -> {resp_cap!r}")
         self.root.after(0, lambda: self._on_discovery_done(ok, msg))
 
     def _on_discovery_done(self, ok: bool, msg: str):
@@ -1364,6 +1367,10 @@ class CoffeeCyclerApp:
             # Adaptive cycle time: use runner's measured mean once 2+ greens seen,
             # otherwise fall back to 90 s per cycle.
             cycle_secs = self.runner.mean_cycle_s if self.runner else 90.0
+            if self.runner and self.runner.mean_cycle_s != 90.0:
+                self.mean_cycle_value.set(self._fmt_time(int(cycle_secs)))
+            else:
+                self.mean_cycle_value.set("--")
             remaining_cycles = max(0, total - self.current_cycle)
             remaining = int(remaining_cycles * cycle_secs)
             self.eta_value.set(self._fmt_time(remaining))
