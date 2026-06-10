@@ -68,12 +68,22 @@ arduino-cli version    # sanity check (expect 1.5.x)
 # you ran it (e.g. /home/pi/autocycler/bin). Just move it onto PATH instead:
 #   sudo mv /home/pi/autocycler/bin/arduino-cli /usr/local/bin/
 
-# 3b. Add the ESP32 board package and install the core
+# 3b. Add the ESP32 board package and install the core.
 arduino-cli config init
 arduino-cli config add board_manager.additional_urls \
   https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core update-index
-arduino-cli core install esp32:esp32
+
+# IMPORTANT — pick the core version for your OS:
+#   Raspberry Pi OS Bookworm (glibc >= 2.34): the latest core 3.x works:
+#       arduino-cli core install esp32:esp32
+#   Raspberry Pi OS Bullseye / Buster (glibc 2.31 / 2.28): the esptool bundled with
+#   core 3.x is a frozen binary that needs GLIBC_2.33/2.34 and will fail with
+#   "version `GLIBC_2.34' not found". Pin the 2.0.x line, which ships esptool.py as a
+#   plain Python script and runs on the Pi's own Python:
+#       arduino-cli core install esp32:esp32@2.0.17
+# Check your glibc with:  ldd --version | head -1
+arduino-cli core install esp32:esp32@2.0.17
 
 # 3c. Install the two libraries the FRONT sketch needs (deps pulled automatically)
 arduino-cli lib install "Adafruit TCS34725"
