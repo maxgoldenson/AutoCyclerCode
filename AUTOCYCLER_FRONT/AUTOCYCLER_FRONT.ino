@@ -231,16 +231,18 @@ void setup() {
 
   Wire.begin();
 
+  // Report sensor problems but DO NOT halt: a halted board never sends READY and
+  // never answers WHO AM I, so the host can't identify it (to connect OR to flash new
+  // firmware). Stay alive in a degraded state instead — GET COLOR will return an error,
+  // while SET SERVO / SET CAP / WHO AM I keep working.
   selectMuxChannel(MUX_CH_RING);
   if (!tcs.begin()) {
     Serial.println("ERROR:TCS34725 not found on Ring channel (MUX ch 0). Check wiring.");
-    while (1) { delay(1000); }
   }
 
   selectMuxChannel(MUX_CH_ERROR);
   if (!tcs.begin()) {
     Serial.println("ERROR:TCS34725 not found on Error channel (MUX ch 1). Check wiring.");
-    while (1) { delay(1000); }
   }
 
   Serial.print("READY:");

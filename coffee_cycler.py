@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-10 21:58"
+VERSION = "2026-06-10 22:28"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +62,13 @@ BOOT_TIMEOUT      = 4.0
 AUTO_RECONNECT_S  = 15.0   # idle re-scan interval when devices aren't connected yet
 _POSIX            = (os.name == "posix")   # serial exclusive lock is POSIX-only
 _EXCLUSIVE        = True if _POSIX else None  # fail fast if a port is already open
+
+
+def _is_onboard_uart(device: str) -> bool:
+    """The Pi's onboard UART (console / Bluetooth) can block forever on open — never
+    probe it. No-op on Windows (COM ports don't match these prefixes)."""
+    base = os.path.basename(device)
+    return base.startswith(("ttyAMA", "ttyS", "serial", "ttyprintk"))
 
 # -- Device IDs ----------------------------------------------------------------
 ID_DISPENSER = "DISPENSER"
@@ -266,7 +273,8 @@ class DeviceManager:
             if self._probe(port) == dev_id:
                 found[dev_id] = port
         if len(found) < 2:
-            all_ports = [p.device for p in serial.tools.list_ports.comports()]
+            all_ports = [p.device for p in serial.tools.list_ports.comports()
+                         if not _is_onboard_uart(p.device)]
             already   = set(found.values())
             for port in all_ports:
                 if len(found) == 2: break

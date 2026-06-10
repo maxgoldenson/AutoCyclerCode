@@ -35,6 +35,7 @@ import sys
 import json
 import time
 import fcntl
+import signal
 import socket
 import hashlib
 import logging
@@ -316,10 +317,22 @@ def _upload_board(board: str, port: str) -> bool:
         return False
 
 
+class _ProbeTimeout(Exception):
+    pass
+
+
+def _is_usb_serial(device: str) -> bool:
+    """Only USB-serial adapters are our boards. NEVER open the Pi's onboard UART
+    (ttyAMA*, ttyS*, serial0/1) — opening it can block forever (it backs the console /
+    Bluetooth), which is exactly what was freezing the probe."""
+    base = os.path.basename(device)
+    return base.startswith("ttyUSB") or base.startswith("ttyACM")
+
+
 def _probe_ports() -> dict:
-    """Map board identity -> serial port by sending WHO AM I to each candidate port.
-    The app MUST be stopped (ports free) before calling this, or you get
-    'multiple access on port' errors."""
+    """Map board identity -> serial port by sending WHO AM I to each USB-serial port.
+    Each probe is hard-capped by a timeout so a wedged/unresponsive port can never hang
+    the launcher. The app MUST be stopped (ports free) before calling this."""
     try:
         import serial
         import serial.tools.list_ports
@@ -327,9 +340,20 @@ def _probe_ports() -> dict:
         log.error("pyserial unavailable, cannot identify boards: %s", e)
         return {}
 
+    have_alarm = hasattr(signal, "SIGALRM")
+
+    def _on_alarm(_signum, _frame):
+        raise _ProbeTimeout()
+
     mapping: dict = {}
     for p in serial.tools.list_ports.comports():
         port = p.device
+        if not _is_usb_serial(port):
+            continue   # skip onboard UART / console / Bluetooth — never block on it
+        s = None
+        if have_alarm:
+            old = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.alarm(8)   # hard cap on the whole open+read for this port
         try:
             # exclusive=True: if anything else still holds the port, fail fast here
             # (caught below) instead of opening a second handle and garbling comms.
@@ -344,14 +368,28 @@ def _probe_ports() -> dict:
             s.write(b"WHO AM I\n")
             s.timeout = 4.0
             resp = s.readline().decode("utf-8", errors="replace").strip()
-            s.close()
             if resp.startswith("IAM:"):
                 ident = resp[4:].strip()
                 if ident in FIRMWARE:
                     mapping[ident] = port
                     log.info("Identified %s on %s.", ident, port)
+                else:
+                    log.info("Probe %s: unknown id %r.", port, ident)
+            else:
+                log.info("Probe %s: no WHO AM I reply (%r).", port, resp)
+        except _ProbeTimeout:
+            log.warning("Probe %s timed out (wedged/unresponsive); skipping.", port)
         except Exception as e:
             log.info("Probe %s skipped: %s", port, e)
+        finally:
+            if have_alarm:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
     return mapping
 
 
