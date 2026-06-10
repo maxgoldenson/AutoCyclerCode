@@ -50,7 +50,10 @@ FLASH_STATE  = os.path.join(APP_DIR, "flashed_firmware.json")
 LOG_PATH     = os.path.join(APP_DIR, "launcher.log")
 
 # ── Repo / URLs ─────────────────────────────────────────────────────────────────
-GITHUB_BRANCH = "main"
+# Branch the Pi polls for app + firmware updates. Override on the Pi with the
+# AUTOCYCLER_BRANCH env var (e.g. set it to "main" once this work is merged).
+# raw.githubusercontent.com resolves branch names that contain "/".
+GITHUB_BRANCH = os.environ.get("AUTOCYCLER_BRANCH", "claude/wonderful-allen-o1258o")
 RAW_BASE      = f"https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/{GITHUB_BRANCH}"
 APP_URL       = f"{RAW_BASE}/coffee_cycler.py"
 
