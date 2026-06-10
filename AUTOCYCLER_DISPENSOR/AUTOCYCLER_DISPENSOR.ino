@@ -73,6 +73,14 @@ void stepDegrees(float degrees) {
         delayMicroseconds(STEP_DELAY_MICROS);
         digitalWrite(STEP_PIN, LOW);
         delayMicroseconds(STEP_DELAY_MICROS);
+
+        // This move can run several seconds — past the ~5s ESP32 task watchdog. Without
+        // feeding it, the watchdog fires mid-move and dumps warning text onto the serial
+        // line, corrupting the ANGLE: reply (the front board never blocks this long, so
+        // it never sees this). yield() lets the idle task run and resets the watchdog;
+        // it returns in microseconds when nothing else is pending, so step timing is
+        // unaffected. Every 64 steps (~50 ms) is far more often than the watchdog needs.
+        if ((i & 0x3F) == 0) yield();
     }
 }
 
