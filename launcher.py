@@ -135,6 +135,23 @@ def kill_stray_apps():
         log.info("Stray-app cleanup skipped: %s", e)
 
 
+def free_serial_ports():
+    """Forcibly free the serial ports before flashing — SIGKILL whatever still holds a
+    tty (a stray app, a duplicate, a ModemManager probe). This is what guarantees the
+    probe/upload isn't fighting another process for the port."""
+    ports = _list_serial_ports()
+    if not ports:
+        return
+    try:
+        # fuser -k sends SIGKILL to every process with the device open.
+        subprocess.run(["fuser", "-k"] + ports, capture_output=True, timeout=10)
+        time.sleep(1)
+    except FileNotFoundError:
+        log.info("fuser not installed; skipping forced port-free (install psmisc).")
+    except Exception as e:
+        log.info("Forced port-free skipped: %s", e)
+
+
 # =============================================================================
 #  Small helpers
 # =============================================================================
@@ -432,8 +449,9 @@ def flash_boards(changes: dict, app=None):
     splash = None
     if app is not None:
         app.stop()
-        kill_stray_apps()   # make sure no orphan app is still holding the ports
-        time.sleep(1)       # let the OS release the port fds / USB settle
+        kill_stray_apps()    # kill any orphan coffee_cycler.py by name
+        free_serial_ports()  # SIGKILL anything else still holding the ports (ModemManager, etc.)
+        time.sleep(1)        # let the OS release the port fds / USB settle
         splash = _show_splash("Updating firmware…\nPlease wait — this takes a minute.")
     try:
         mapping = _probe_ports()

@@ -29,13 +29,19 @@ die() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 say "AutoCycler setup  (branch=${BRANCH}, dir=${DIR}, fqbn=${FQBN})"
 mkdir -p "${DIR}/AUTOCYCLER_DISPENSOR" "${DIR}/AUTOCYCLER_FRONT" || die "cannot create ${DIR}"
 
-# ── 1. System packages (Python GUI + serial) ────────────────────────────────
+# ── 1. System packages (Python GUI + serial + fuser) ────────────────────────
 say "System packages"
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -y || true
-  sudo apt-get install -y python3 python3-tk python3-serial curl || \
+  sudo apt-get install -y python3 python3-tk python3-serial psmisc curl || \
     echo "(apt install had issues — continuing; ensure python3-tk and python3-serial exist)"
 fi
+
+# ── 1b. Disable ModemManager — it grabs USB-serial devices and probes them with
+#        AT commands, which corrupts our comms ("device reports readiness to read but
+#        returned no data") and fights firmware flashing. The boards are not modems.
+say "Disabling ModemManager (serial interference)"
+sudo systemctl disable --now ModemManager 2>/dev/null || true
 
 # ── 2. arduino-cli ──────────────────────────────────────────────────────────
 say "arduino-cli"
