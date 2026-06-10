@@ -34,6 +34,7 @@ import os
 import sys
 import json
 import time
+import fcntl
 import socket
 import hashlib
 import logging
@@ -49,6 +50,7 @@ FLASH_STATE   = os.path.join(APP_DIR, "flashed_firmware.json")
 LOG_PATH      = os.path.join(APP_DIR, "launcher.log")
 STATUS_FILE   = os.path.join(APP_DIR, "launcher_status.txt")   # human-readable state
 SPLASH_SCRIPT = os.path.join(APP_DIR, "flash_splash.py")       # "please wait" screen
+LOCK_FILE     = os.path.join(APP_DIR, "launcher.lock")         # single-instance guard
 
 # ── Repo / URLs ─────────────────────────────────────────────────────────────────
 # Branch the Pi polls for app + firmware updates. Override on the Pi with the
@@ -100,6 +102,37 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
                     handlers=_handlers)
 log = logging.getLogger("launcher")
+
+# Held for the whole process lifetime to enforce a single launcher (see below).
+_lock_handle = None
+
+
+# =============================================================================
+#  Single-instance + stray-process guards
+# =============================================================================
+def acquire_single_instance() -> bool:
+    """Take an exclusive lock so only ONE launcher ever runs. Duplicate launchers (a
+    second autostart entry, a stray respawn, a manual run colliding with autostart) are
+    the root cause of two apps fighting over the serial ports — this prevents that."""
+    global _lock_handle
+    try:
+        _lock_handle = open(LOCK_FILE, "w")
+        fcntl.flock(_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_handle.write(str(os.getpid()))
+        _lock_handle.flush()
+        return True
+    except Exception:
+        return False
+
+
+def kill_stray_apps():
+    """Best-effort kill of any orphan coffee_cycler.py left by a previous run/instance,
+    so it can't keep a serial port open and corrupt comms ('multiple access on port')."""
+    try:
+        subprocess.run(["pkill", "-f", os.path.basename(LOCAL_SCRIPT)],
+                       capture_output=True, timeout=10)
+    except Exception as e:
+        log.info("Stray-app cleanup skipped: %s", e)
 
 
 # =============================================================================
@@ -281,7 +314,9 @@ def _probe_ports() -> dict:
     for p in serial.tools.list_ports.comports():
         port = p.device
         try:
-            s = serial.Serial(port, PROBE_BAUD, timeout=1.0)
+            # exclusive=True: if anything else still holds the port, fail fast here
+            # (caught below) instead of opening a second handle and garbling comms.
+            s = serial.Serial(port, PROBE_BAUD, timeout=1.0, exclusive=True)
             # Opening the port may reset the board (DTR) — wait for its READY banner.
             deadline = time.time() + 4.0
             while time.time() < deadline:
@@ -397,7 +432,8 @@ def flash_boards(changes: dict, app=None):
     splash = None
     if app is not None:
         app.stop()
-        time.sleep(1)   # let the OS release the port fds / USB settle
+        kill_stray_apps()   # make sure no orphan app is still holding the ports
+        time.sleep(1)       # let the OS release the port fds / USB settle
         splash = _show_splash("Updating firmware…\nPlease wait — this takes a minute.")
     try:
         mapping = _probe_ports()
@@ -479,6 +515,15 @@ def _apply_updates(app: App):
 
 
 def main():
+    # Exactly one launcher. A duplicate would spawn a second app that fights over the
+    # serial ports (garbled comms, wedged flashing). If we're the duplicate, back off
+    # and exit rather than hammer a respawn loop.
+    if not acquire_single_instance():
+        log.warning("Another launcher is already running — exiting this duplicate.")
+        time.sleep(30)
+        return
+    kill_stray_apps()   # clear any orphan app holding the serial ports from a prior run
+
     app = App()
 
     # If there is no app on disk yet (fresh install) we can't show anything until we

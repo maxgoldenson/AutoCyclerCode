@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-10 21:39"
+VERSION = "2026-06-10 21:58"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +60,8 @@ DISCOVERY_TIMEOUT = 4.0
 CMD_TIMEOUT       = 15.0
 BOOT_TIMEOUT      = 4.0
 AUTO_RECONNECT_S  = 15.0   # idle re-scan interval when devices aren't connected yet
+_POSIX            = (os.name == "posix")   # serial exclusive lock is POSIX-only
+_EXCLUSIVE        = True if _POSIX else None  # fail fast if a port is already open
 
 # -- Device IDs ----------------------------------------------------------------
 ID_DISPENSER = "DISPENSER"
@@ -126,6 +128,7 @@ class SerialDevice:
             write_timeout=5.0,
             dsrdtr=False,    # don't toggle DTR — prevents spurious resets on some Pi USB ports
             rtscts=False,    # disable hardware flow control — not needed and causes issues on some chips
+            exclusive=_EXCLUSIVE,  # refuse to share the port — guards against a 2nd app instance
         )
         time.sleep(0.1)      # let USB-serial enumeration settle before first byte
         _wait_for_ready(self._ser)
@@ -242,7 +245,7 @@ class DeviceManager:
 
     def _probe(self, port: str) -> Optional[str]:
         try:
-            s = serial.Serial(port, BAUD_RATE, timeout=1.0)
+            s = serial.Serial(port, BAUD_RATE, timeout=1.0, exclusive=_EXCLUSIVE)
             _wait_for_ready(s)
             s.reset_input_buffer()
             s.write(b"WHO AM I\n")
