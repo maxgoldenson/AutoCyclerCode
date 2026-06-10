@@ -100,6 +100,31 @@ def test_failed_flash_is_retried():
     print("PASS: failed flash is retried, then recorded on success")
 
 
+def test_unidentified_present_board_flashed_by_inference():
+    # A board whose old firmware is halted won't answer WHO AM I, but if it's the only
+    # unidentified changed board and there's exactly one free USB port, flash it there.
+    launcher._have_arduino_cli = lambda: True
+    launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+    launcher._compile_board = lambda b: True
+
+    # Make everything current, then bump only FRONT and have it NOT answer the probe.
+    launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"}
+    launcher._upload_board = lambda b, port: True
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())
+    assert launcher.fetch_firmware_changes() == {}
+
+    _REMOTE[launcher.FIRMWARE["FRONT_ASSEMBLY"]["url"]] = b"FRONT FW HALTED-UPGRADE"
+    launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0"}   # FRONT stays silent
+    flashed = {}
+    launcher._upload_board = lambda b, port: (flashed.__setitem__(b, port) or True)
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())
+    assert flashed.get("FRONT_ASSEMBLY") == "/dev/ttyUSB1", flashed
+    assert launcher.fetch_firmware_changes() == {}
+    print("PASS: unidentified-but-present board flashed by inference on the free port")
+
+
 def test_no_devices_present_defers_flash():
     _REMOTE[launcher.FIRMWARE["DISPENSER"]["url"]] = b"DISPENSER FW V9"
     launcher._have_arduino_cli = lambda: True
@@ -134,6 +159,7 @@ if __name__ == "__main__":
         test_successful_flash_records_and_clears,
         test_only_changed_board_reflashes,
         test_failed_flash_is_retried,
+        test_unidentified_present_board_flashed_by_inference,
         test_no_devices_present_defers_flash,
         test_missing_toolchain_does_not_record,
     ]

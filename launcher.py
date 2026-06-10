@@ -493,6 +493,20 @@ def flash_boards(changes: dict, app=None):
         splash = _show_splash("Updating firmware…\nPlease wait — this takes a minute.")
     try:
         mapping = _probe_ports()
+        # A board whose CURRENT firmware is halted/stale may not answer WHO AM I, yet it
+        # is still flashable by port. If exactly one changed board is unidentified and
+        # exactly one USB-serial port is unclaimed, pair them — unambiguous on a 2-board
+        # rig, and safe because any board that *did* answer is already claimed (so we
+        # can't misroute, e.g. flash FRONT firmware onto an identified DISPENSER).
+        claimed = set(mapping.values())
+        free_usb = [d for d in _list_serial_ports()
+                    if _is_usb_serial(d) and d not in claimed]
+        unidentified = [b for b in compiled if b not in mapping]
+        if len(unidentified) == 1 and len(free_usb) == 1:
+            mapping[unidentified[0]] = free_usb[0]
+            log.warning("%s did not answer WHO AM I; flashing it on the only free USB "
+                        "port %s (its firmware may be halted).",
+                        unidentified[0], free_usb[0])
         state = _load_flash_state()
         for board, md5 in compiled.items():
             port = mapping.get(board)
