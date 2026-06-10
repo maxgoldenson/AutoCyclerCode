@@ -54,10 +54,10 @@ SPLASH_SCRIPT = os.path.join(APP_DIR, "flash_splash.py")       # "please wait" s
 LOCK_FILE     = os.path.join(APP_DIR, "launcher.lock")         # single-instance guard
 
 # ── Repo / URLs ─────────────────────────────────────────────────────────────────
-# Branch the Pi polls for app + firmware updates. Override on the Pi with the
-# AUTOCYCLER_BRANCH env var (e.g. set it to "main" once this work is merged).
+# Branch the Pi polls for app + firmware updates. Override per-Pi with the
+# AUTOCYCLER_BRANCH env var if you want a tester on a different branch.
 # raw.githubusercontent.com resolves branch names that contain "/".
-GITHUB_BRANCH = os.environ.get("AUTOCYCLER_BRANCH", "claude/wonderful-allen-o1258o")
+GITHUB_BRANCH = os.environ.get("AUTOCYCLER_BRANCH", "main")
 RAW_BASE      = f"https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/{GITHUB_BRANCH}"
 APP_URL       = f"{RAW_BASE}/coffee_cycler.py"
 

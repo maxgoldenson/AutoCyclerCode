@@ -6,7 +6,7 @@ One script does everything below — toolchain, libraries, code, autostart. Run 
 Pi as the `pi` user:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/claude/wonderful-allen-o1258o/pi_install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/main/pi_install.sh | bash
 sudo reboot
 ```
 
@@ -37,12 +37,12 @@ yours is elsewhere, substitute that path and set `AUTOCYCLER_DIR` in the boot en
 
 ## Step 1 — Put the new launcher on the Pi
 
-The Pi will poll the **`claude/wonderful-allen-o1258o`** branch (already baked into the
+The Pi will poll the **`main`** branch (already baked into the
 default; see Step 2 to change it).
 
 ```bash
 cd /home/pi/autocycler
-BRANCH=claude/wonderful-allen-o1258o
+BRANCH=main
 RAW="https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/${BRANCH}"
 
 curl -fsSL "${RAW}/launcher.py"   -o launcher.py
@@ -69,7 +69,7 @@ Quick check that the branch is reachable:
 
 ```bash
 curl -fsS -o /dev/null -w "%{http_code}\n" \
-  "https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/claude/wonderful-allen-o1258o/coffee_cycler.py"
+  "https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/main/coffee_cycler.py"
 # expect: 200
 ```
 

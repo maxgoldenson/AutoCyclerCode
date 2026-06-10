@@ -7,14 +7,14 @@
 #  only where needed) — do NOT run the whole thing as root.
 #
 #  Paste-and-run, or:
-#    curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/claude/wonderful-allen-o1258o/pi_install.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/main/pi_install.sh | bash
 #
 #  Override defaults with env vars, e.g.:
 #    AUTOCYCLER_BRANCH=main ESP32_FQBN=esp32:esp32:esp32doit-devkit-v1 bash pi_install.sh
 # =============================================================================
 set -u
 
-BRANCH="${AUTOCYCLER_BRANCH:-claude/wonderful-allen-o1258o}"
+BRANCH="${AUTOCYCLER_BRANCH:-main}"
 DIR="${AUTOCYCLER_DIR:-/home/pi/autocycler}"
 FQBN="${ESP32_FQBN:-esp32:esp32:esp32}"
 # Pin the 2.0.x core: it ships esptool.py (plain Python), so it works on older Pi OS
