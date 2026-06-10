@@ -45,8 +45,17 @@ Adafruit_TCS34725 tcs = Adafruit_TCS34725(
 
 Servo myServo;
 
+// ── Safety / failsafe config ────────────────────────────────────────────────────
+// If the host ever fails to release the brew trigger (crash, USB unplug, killed
+// process), auto-release CAP after this long so the machine's start button can never
+// be held pressed indefinitely. Set well above the longest legitimate hold — the
+// host's 10s reset hold — so a real operation is never cut short.
+#define CAP_MAX_ON_MS 15000UL
+#define SERVO_REST_DEG 95   // safe "gate closed" position to assume on boot
+
 // ── State ──────────────────────────────────────────────────────────────────────
 bool capActive = false;
+unsigned long capOnMillis = 0;   // millis() at the moment CAP was last asserted
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,6 +79,7 @@ bool readRGB(uint8_t channel, uint8_t &r, uint8_t &g, uint8_t &b) {
 void setCapPin(bool active) {
   capActive = active;
   if (active) {
+    capOnMillis = millis();   // start the auto-release watchdog
     pinMode(CAP_PIN, OUTPUT);
     digitalWrite(CAP_PIN, LOW);
   } else {
@@ -215,6 +225,7 @@ void setup() {
 
   myServo.setPeriodHertz(50);
   myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(SERVO_REST_DEG);   // boot to a known safe (gate closed) position
 
   pinMode(CAP_PIN, INPUT);
 
@@ -237,6 +248,13 @@ void setup() {
 }
 
 void loop() {
+  // Failsafe watchdog: never let the brew trigger stay asserted indefinitely. If the
+  // host fails to send SET CAP OFF (crash / unplug / killed process), release it here.
+  if (capActive && (millis() - capOnMillis > CAP_MAX_ON_MS)) {
+    setCapPin(false);
+    Serial.println("EVENT:CAP_AUTORELEASE");
+  }
+
   if (Serial.available()) {
     String line = Serial.readStringUntil('\n');
     dispatch(line);

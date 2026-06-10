@@ -12,9 +12,17 @@ Automated coffee machine cycler with two ESP32-based Arduino boards communicatin
 
 **Protocol (115200 baud, newline-terminated):**
 - `WHO AM I` → `IAM:DISPENSER` or `IAM:FRONT_ASSEMBLY`
-- DISPENSER: `SET ANGLE <deg>` → `ANGLE:<deg>`, `SET MOTOR ON/OFF` → `MOTOR:ON/OFF`
+- DISPENSER: `SET ANGLE <deg> [<seq>]` → `ANGLE:<deg>`, `SET MOTOR ON/OFF` → `MOTOR:ON/OFF`
 - FRONT: `GET COLOR` → `RGB:r,g,b`, `SET SERVO <angle>` → `SERVO:<angle>`, `SET CAP ON/OFF` → `CAP:ON/OFF`
 - Both boards send `READY:<ID>` on startup (DTR reset triggers ~1.5 s boot delay)
+
+**Dispense safety (at-most-once):** `SET ANGLE` is a RELATIVE move, so executing it twice
+dispenses twice → overflow. The host (`SerialDevice.dispense()`) sends it EXACTLY ONCE,
+never retried (a lost ack aborts the cycle, fail-safe), and tags it with a monotonic
+`<seq>`. The DISPENSER firmware ignores a duplicate `<seq>` seen within a ~5 s window
+(re-send / RX-buffered frame) and re-acks without moving. The FRONT firmware has a CAP
+auto-release watchdog (`CAP_MAX_ON_MS`, 15 s) so the brew trigger can never stay asserted
+if the host dies. `CycleRunner.run_one()` always returns servo→REST and CAP→OFF on any exit.
 
 **Cycle sequence:**
 1. GET COLOR — abort if not white (min channel >= 160, spread <= 60)

@@ -18,14 +18,48 @@
 
 const float STEPS_PER_DEGREE = (STEPS_PER_REV * MICROSTEPPING) / 360.0f;
 
+// ── Safety limits ──────────────────────────────────────────────────────────────
+// Reject absurd moves from a garbled command — a normal dispense is 360 deg.
+#define MAX_DISPENSE_DEG 1080.0f   // 3 revolutions
+
+// A re-sent / buffered-duplicate dispense arrives within a couple of seconds of the
+// original; the next legitimate cycle's dispense is always tens of seconds later. So
+// we only dedup a repeated seq seen inside this short window — this catches retries
+// and RX-buffered duplicates without ever suppressing a genuine new dispense (even
+// one that reuses a seq value after the host process restarts).
+#define DISPENSE_DEDUP_WINDOW_MS 5000UL
+
 // ── State ──────────────────────────────────────────────────────────────────────
 bool motorEnabled = false;
+long lastDispenseSeq = -1;            // seq id of the last executed SET ANGLE
+unsigned long lastDispenseMillis = 0; // millis() when that dispense completed
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 void setMotorEnabled(bool enable) {
     motorEnabled = enable;
     digitalWrite(ENABLE_PIN, enable ? LOW : HIGH);  // driver is active-low
+}
+
+// Returns true only if s is a valid signed decimal number (e.g. "360", "-12.5").
+// Guards against String::toFloat() silently coercing garbage to 0.0.
+bool isNumeric(const String &s) {
+    if (s.length() == 0) return false;
+    int start = (s[0] == '+' || s[0] == '-') ? 1 : 0;
+    if (start >= (int)s.length()) return false;
+    bool dot = false, digit = false;
+    for (int i = start; i < (int)s.length(); i++) {
+        char c = s[i];
+        if (c == '.') {
+            if (dot) return false;   // more than one decimal point
+            dot = true;
+        } else if (c >= '0' && c <= '9') {
+            digit = true;
+        } else {
+            return false;
+        }
+    }
+    return digit;
 }
 
 void stepDegrees(float degrees) {
@@ -49,9 +83,16 @@ void handleWhoAmI() {
 }
 
 /**
- * SET ANGLE <degrees>
+ * SET ANGLE <degrees> [<seq>]
  * Enables motor, moves, then re-disables unless the motor was already
  * held enabled via SET MOTOR ON.
+ *
+ * <seq> is an optional monotonic id from the host. SET ANGLE is a RELATIVE move,
+ * so executing it twice dispenses twice (an overflow hazard). If a command arrives
+ * whose seq matches the last one already executed, it is treated as a duplicate
+ * (e.g. the host re-sent because an ack was lost, or a frame was buffered during the
+ * blocking move) and is ACKed WITHOUT moving — keeping the dispense at-most-once.
+ * Commands without a seq are executed normally (backward compatible).
  *
  * Response: ANGLE:<degrees>
  */
@@ -61,12 +102,49 @@ void handleSetAngle(const String &args) {
         return;
     }
 
-    float degrees = args.toFloat();
+    // Split an optional trailing sequence id: "<degrees> <seq>".
+    String degStr = args;
+    long seq = -1;
+    int sp = args.indexOf(' ');
+    if (sp >= 0) {
+        degStr = args.substring(0, sp);
+        String seqStr = args.substring(sp + 1);
+        seqStr.trim();
+        if (seqStr.length() > 0) seq = seqStr.toInt();
+    }
+    degStr.trim();
+
+    // Reject non-numeric input rather than silently dispensing 0 deg (a dry brew the
+    // host would read as success).
+    if (!isNumeric(degStr)) {
+        Serial.println("ERROR:SET ANGLE value is not numeric");
+        return;
+    }
+    float degrees = degStr.toFloat();
+
+    // Never make an enormous move from a garbled value.
+    if (fabs(degrees) > MAX_DISPENSE_DEG) {
+        Serial.print("ERROR:SET ANGLE magnitude exceeds limit ");
+        Serial.println(MAX_DISPENSE_DEG);
+        return;
+    }
+
+    // At-most-once: a duplicate seq arriving within the dedup window means the host
+    // re-sent (or a frame was buffered during the blocking move). Ack without moving.
+    if (seq >= 0 && seq == lastDispenseSeq &&
+        (millis() - lastDispenseMillis) < DISPENSE_DEDUP_WINDOW_MS) {
+        Serial.print("ANGLE:"); Serial.println(degrees);
+        return;
+    }
+
     bool wasEnabled = motorEnabled;
 
     setMotorEnabled(true);
     stepDegrees(degrees);
     if (!wasEnabled) setMotorEnabled(false);
+
+    if (seq >= 0) lastDispenseSeq = seq;
+    lastDispenseMillis = millis();
 
     Serial.print("ANGLE:"); Serial.println(degrees);
 }

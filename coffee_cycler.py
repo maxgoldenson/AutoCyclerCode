@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-02 11:43"
+VERSION = "2026-06-10 19:50"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -116,6 +116,9 @@ def _wait_for_ready(ser: serial.Serial, timeout: float = BOOT_TIMEOUT) -> bool:
 class SerialDevice:
     def __init__(self, port: str, baud: int = BAUD_RATE, timeout: float = CMD_TIMEOUT):
         self.port = port
+        self._lock = threading.Lock()   # serialize port access — the cycle worker and
+                                         # the Tk thread must never write at the same time
+        self._seq  = 0                   # monotonic id for at-most-once dispense commands
         self._ser = serial.Serial(
             port, baud,
             timeout=1.0,
@@ -128,33 +131,77 @@ class SerialDevice:
         self._ser.timeout = timeout
         self._ser.reset_input_buffer()
 
+    def _attempt(self, cmd: str, expect: Optional[str], timeout: float) -> Optional[str]:
+        """
+        One write + read cycle. Returns the first line matching `expect` (or any
+        non-blank line if `expect` is None), or None if no valid response arrives
+        before `timeout`. Caller MUST hold self._lock.
+        """
+        self._ser.reset_input_buffer()
+        self._ser.write((cmd + "\n").encode())
+        self._ser.flush()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = self._ser.readline()
+            if not raw:
+                return None  # readline timed out
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue  # blank line — keep draining
+            if expect is None or line.startswith(expect):
+                return line
+            print(f"[serial] discard garbage ({cmd!r}): {line!r}")
+        return None
+
     def send(self, cmd: str, expect: str = None, retries: int = 2) -> str:
         """
         Send cmd and return the response line.
         If expect is given, any line that doesn't start with it is discarded as
         garbage and reading continues.  The full send+read cycle is retried up to
         `retries` times before giving up.
+
+        SAFETY: only route IDEMPOTENT commands through here — reads (GET COLOR,
+        WHO AM I) and absolute set-points (SET SERVO, SET CAP). A retry re-writes the
+        command verbatim, so the firmware executes it again. NEVER send a relative /
+        incremental motion (the dispense) this way; use dispense() instead, or a
+        lost ack would dispense a second time and overflow the machine.
         """
         timeout = self._ser.timeout or CMD_TIMEOUT
-        for attempt in range(retries + 1):
-            if attempt:
-                time.sleep(0.3)
-            self._ser.reset_input_buffer()
-            self._ser.write((cmd + "\n").encode())
-            self._ser.flush()
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                raw = self._ser.readline()
-                if not raw:
-                    break  # readline timed out — try next attempt
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue  # blank line — keep draining
-                if expect is None or line.startswith(expect):
+        with self._lock:
+            for attempt in range(retries + 1):
+                if attempt:
+                    time.sleep(0.3)
+                line = self._attempt(cmd, expect, timeout)
+                if line is not None:
                     return line
-                print(f"[serial] discard garbage ({cmd!r}): {line!r}")
-            print(f"[serial] no valid response, attempt {attempt + 1}/{retries + 1}: {cmd!r}")
-        return ""
+                print(f"[serial] no valid response, attempt {attempt + 1}/{retries + 1}: {cmd!r}")
+            return ""
+
+    def dispense(self, degrees, expect: str = "ANGLE:") -> str:
+        """
+        Fire a SINGLE relative dispense move (SET ANGLE) and return the ack line,
+        or "" if no ack arrived.
+
+        This command is NON-IDEMPOTENT: each execution steps the motor another
+        `degrees`, dispensing more coffee. It is therefore sent EXACTLY ONCE and is
+        NEVER retried — a lost ack must abort the cycle (fail-safe) rather than risk a
+        second dispense and an overflow. (This was the root cause of the observed
+        "dispensed three times" failure: send()'s retry loop re-issued SET ANGLE up
+        to three times when an ack was lost.)
+
+        A monotonic sequence id is appended ("SET ANGLE <deg> <seq>") so firmware
+        that understands it can ignore a re-delivered duplicate (defence in depth);
+        older firmware ignores the trailing token and still dispenses exactly once.
+        """
+        timeout = self._ser.timeout or CMD_TIMEOUT
+        with self._lock:
+            self._seq += 1
+            cmd = f"SET ANGLE {degrees} {self._seq}"
+            line = self._attempt(cmd, expect, timeout)
+            if line is None:
+                print(f"[serial] dispense got no ack (NOT retried): {cmd!r}")
+                return ""
+            return line
 
     def close(self):
         try:
@@ -382,7 +429,37 @@ class CycleRunner:
         print(f"[cycle] step {num}: {label}  (hold {hold:.1f}s)")
         return _sleep(hold, stop_flag)
 
+    def _safe_hardware(self):
+        """
+        Best-effort return to a safe state: close the gate (servo -> REST) and
+        release the brew trigger (CAP -> OFF). Safe to call on any cycle exit;
+        swallows serial errors so it never masks the real cycle result.
+        """
+        f = self.dev.front
+        if f is None:
+            return
+        try:
+            f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
+        except Exception as e:
+            print(f"[safe] servo rest failed: {e}")
+        try:
+            f.send("SET CAP OFF", expect="CAP:")
+        except Exception as e:
+            print(f"[safe] cap off failed: {e}")
+
     def run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
+        """
+        Run one full brew cycle. Guarantees that no matter how the cycle ends —
+        normal completion, user stop, error, or an unexpected exception — the gate
+        is closed and the brew trigger is released before returning. Leaving the
+        gate open or CAP asserted is an overflow / continuous-trigger hazard.
+        """
+        try:
+            return self._run_one(stop_flag, status_cb)
+        finally:
+            self._safe_hardware()
+
+    def _run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
         self._cycle_count += 1
         d, f = self.dev.dispenser, self.dev.front
 
@@ -407,11 +484,13 @@ class CycleRunner:
 
         status_cb(2, "Dispensing ~19 g...")
         t0   = time.time()
-        resp = d.send("SET ANGLE 360", expect="ANGLE:")
-        print(f"[serial] SET ANGLE 360 -> {resp!r}")
+        # One-shot, never-retried dispense. A lost ack aborts the cycle (fail-safe)
+        # rather than re-sending and risking a second dispense / overflow.
+        resp = d.dispense(360)
+        print(f"[serial] dispense 360 -> {resp!r}")
         elapsed = time.time() - t0
         if not resp.startswith("ANGLE:"):
-            return False, f"Dispense failed: {resp or '(no response)'}"
+            return False, f"Dispense failed (not retried for safety): {resp or '(no response)'}"
         if not self._step(2, f"Dispensed  ({elapsed:.1f}s)", status_cb, stop_flag, elapsed):
             return False, "Stopped"
 
@@ -483,6 +562,7 @@ class CoffeeCyclerApp:
         self.maint_interval_var = tk.IntVar(value=50)
         self.current_cycle    = 0
         self.cycle_thread: Optional[threading.Thread] = None
+        self._starting        = False   # guards against re-entrant / double Start
         self.stop_flag        = threading.Event()
         self._maintenance_resume = threading.Event()
         self._maintenance_resume.set()
@@ -1005,39 +1085,62 @@ class CoffeeCyclerApp:
     #  Cycle start / stop
     # =========================================================================
     def _on_start(self):
+        # Guard against re-entrancy / double start. A second worker thread would
+        # drive the same serial devices concurrently and could dispense twice within
+        # one logical cycle. is_alive() blocks a restart while a worker still runs;
+        # _starting blocks a second entry while the (modal) prestart dialog is open.
+        if self._starting:
+            return
+        if self.cycle_thread and self.cycle_thread.is_alive():
+            return
         if not self.devices.ready:
             messagebox.showerror("Not connected", "Devices are not connected. Click Reconnect.")
             return
+
+        self._starting = True
         try:
-            n = int(self.total_cycles.get())
-            if n < 1: raise ValueError
-        except (tk.TclError, ValueError):
-            messagebox.showerror("Invalid input", "Please enter a valid number of cycles (>= 1).")
-            return
-        if not self._show_prestart_dialog():
-            return
+            try:
+                n = int(self.total_cycles.get())
+                if n < 1: raise ValueError
+            except (tk.TclError, ValueError):
+                messagebox.showerror("Invalid input", "Please enter a valid number of cycles (>= 1).")
+                return
+            try:
+                ring_wait_min  = int(self.ring_wait_min_var.get())
+                ring_timeout   = int(self.ring_timeout_var.get())
+                maint_interval = int(self.maint_interval_var.get())
+                if ring_wait_min < 1 or ring_timeout < 1 or maint_interval < 1:
+                    raise ValueError
+            except (tk.TclError, ValueError):
+                messagebox.showerror(
+                    "Invalid input",
+                    "Ring wait, ring timeout, and maintenance interval must all be whole "
+                    "numbers >= 1.")
+                return
 
-        for w in (self.cycles_entry, self.ring_min_entry,
-                  self.ring_timeout_entry, self.maint_entry):
-            w.configure(state="disabled")
-        self.start_btn.configure(state="disabled")
-        self.reconnect_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self._set_status("Running...", self.ACCENT)
+            if not self._show_prestart_dialog():
+                return
 
-        self.stop_flag.clear()
-        self.start_time    = time.time()
-        self.current_cycle = 0
-        ring_wait_min  = int(self.ring_wait_min_var.get())
-        ring_timeout   = int(self.ring_timeout_var.get())
-        maint_interval = int(self.maint_interval_var.get())
-        self._maintenance_resume.set()
-        self.cycle_thread = threading.Thread(
-            target=self._run_cycles,
-            args=(n, ring_wait_min, ring_timeout, maint_interval),
-            daemon=True,
-        )
-        self.cycle_thread.start()
+            for w in (self.cycles_entry, self.ring_min_entry,
+                      self.ring_timeout_entry, self.maint_entry):
+                w.configure(state="disabled")
+            self.start_btn.configure(state="disabled")
+            self.reconnect_btn.configure(state="disabled")
+            self.stop_btn.configure(state="normal")
+            self._set_status("Running...", self.ACCENT)
+
+            self.stop_flag.clear()
+            self.start_time    = time.time()
+            self.current_cycle = 0
+            self._maintenance_resume.set()
+            self.cycle_thread = threading.Thread(
+                target=self._run_cycles,
+                args=(n, ring_wait_min, ring_timeout, maint_interval),
+                daemon=True,
+            )
+            self.cycle_thread.start()
+        finally:
+            self._starting = False
 
     # =========================================================================
     #  Dialogs
@@ -1109,7 +1212,7 @@ class CoffeeCyclerApp:
         return result["ok"]
 
     def _show_ring_warning_dialog(self, color: str, detail: str) -> str:
-        result = {"action": None}
+        result = {"action": None, "dlg": None}
         ready  = threading.Event()
         warning_msg = {
             "orange": "The machine may still be in a brew cycle or draining.",
@@ -1119,6 +1222,7 @@ class CoffeeCyclerApp:
 
         def _build():
             dlg = tk.Toplevel(self.root)
+            result["dlg"] = dlg
             dlg.title(f"{color.title()} Ring Warning")
             dlg.configure(bg=self.PANEL)
             dlg.transient(self.root)
@@ -1166,7 +1270,19 @@ class CoffeeCyclerApp:
             ], start_idx=0)
 
         self.root.after(0, _build)
-        ready.wait()
+        # Wait for the operator's choice, but stay responsive to a Stop request so the
+        # worker thread can never be parked here indefinitely. (The dialog has no
+        # window-manager close button by design, so polling Stop is the only escape.)
+        while not ready.wait(timeout=0.2):
+            if self.stop_flag.is_set():
+                def _close():
+                    self._pend_pop_context()
+                    dlg = result.get("dlg")
+                    if dlg is not None:
+                        try: dlg.destroy()
+                        except tk.TclError: pass
+                self.root.after(0, _close)
+                return "stop"
         return result["action"]
 
     def _show_maintenance_dialog(self, completed: int):
@@ -1176,6 +1292,9 @@ class CoffeeCyclerApp:
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.geometry("420x400")
+        # No WM close button: the worker is parked waiting on Resume/Stop. Closing the
+        # window via the WM would strand it. Force a deliberate Resume or Stop choice.
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
 
         tk.Label(dlg, text=f"Maintenance pause after cycle {completed}",
                  bg=self.PANEL, fg=self.TEXT,
@@ -1320,7 +1439,6 @@ class CoffeeCyclerApp:
         if confirmed["stop"]:
             self.stop_flag.set()
             self._set_status("Stopping...", self.WARNING)
-        self._set_status("Stopping...", self.WARNING)
 
     def _on_finished(self, stopped: bool):
         self._reset_controls()
