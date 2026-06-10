@@ -35,6 +35,7 @@ import threading
 import time
 import json
 import os
+import random
 import datetime
 from typing import Optional
 
@@ -48,7 +49,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-10 23:12"
+VERSION = "2026-06-10 23:36"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +63,20 @@ BOOT_TIMEOUT      = 4.0
 AUTO_RECONNECT_S  = 15.0   # idle re-scan interval when devices aren't connected yet
 _POSIX            = (os.name == "posix")   # serial exclusive lock is POSIX-only
 _EXCLUSIVE        = True if _POSIX else None  # fail fast if a port is already open
+
+# -- Dispense verification protocol ---------------------------------------------
+# The dispense ack can be corrupted/lost (motor EMI lands right on the UART frame).
+# Instead of guessing, the host VERIFIES: if the ANGLE: ack doesn't arrive, it asks the
+# firmware GET STATUS -> STATUS:<bootId>,<lastSeq>,<lastDeg> whether the seq it sent was
+# executed. Executed -> success; provably not executed (same boot id, lastSeq unchanged)
+# -> one same-seq re-send (the firmware dedups by seq equality, so this stays
+# at-most-once even if the proof was stale); boot id changed / READY seen -> the board
+# reset mid-move and nothing is re-sent (dose unknown; under-dose beats overflow).
+DISPENSE_ACK_TIMEOUT_S = 12.0  # > worst-case move (~8 s) + ack settle + margin
+STATUS_PROBE_TIMEOUT_S = 3.0   # one GET STATUS round trip
+STATUS_PROBE_BUDGET_S  = 15.0  # keep probing this long (covers a move still running
+                               # when the first probe lands -- replies queue until done)
+DISPENSE_MAX_SENDS     = 2     # initial send + at most one PROVEN-safe re-send
 
 
 def _is_onboard_uart(device: str) -> bool:
@@ -128,7 +143,11 @@ class SerialDevice:
         self.port = port
         self._lock = threading.Lock()   # serialize port access — the cycle worker and
                                          # the Tk thread must never write at the same time
-        self._seq  = 0                   # monotonic id for at-most-once dispense commands
+        # Dispense seq ids: session-random base + monotonic. Random because the boards
+        # stay powered across app restarts (dsrdtr=False), so the firmware remembers the
+        # previous session's lastSeq — starting at 0 every session could collide with it
+        # and wrongly dedup a real dispense (silent under-dose).
+        self._seq  = random.randrange(1, 1_000_000_000)
         self._ser = serial.Serial(
             port, baud,
             timeout=1.0,
@@ -188,32 +207,98 @@ class SerialDevice:
                 print(f"[serial] no valid response, attempt {attempt + 1}/{retries + 1}: {cmd!r}")
             return ""
 
-    def dispense(self, degrees, expect: str = "ANGLE:") -> str:
-        """
-        Fire a SINGLE relative dispense move (SET ANGLE) and return the ack line,
-        or "" if no ack arrived.
+    def _read_status(self):
+        """One GET STATUS round trip (idempotent, safe to repeat). Caller MUST hold
+        self._lock. Returns (boot_id, last_seq) or None if no parseable reply."""
+        line = self._attempt("GET STATUS", "STATUS:", STATUS_PROBE_TIMEOUT_S)
+        if not line:
+            return None
+        try:
+            boot_s, seq_s, _deg = line[len("STATUS:"):].split(",", 2)
+            return int(boot_s), int(seq_s)
+        except ValueError:
+            print(f"[serial] unparseable STATUS: {line!r}")
+            return None
 
-        This command is NON-IDEMPOTENT: each execution steps the motor another
-        `degrees`, dispensing more coffee. It is therefore sent EXACTLY ONCE and is
-        NEVER retried — re-sending is what caused the original "dispensed three times"
-        overflow (send()'s retry loop re-issued SET ANGLE when an ack was lost). Because
-        it is single-shot, a missing/garbled ack can NOT cause a double dispense, so the
-        caller may safely continue the cycle on a lost ack (worst case: one under-dosed
-        cup) rather than aborting the whole run.
+    def _await_dispense_ack(self, deadline: float) -> str:
+        """Read until the ANGLE: ack, a READY: boot banner (=> the board RESET mid-move),
+        or the deadline. Caller MUST hold self._lock."""
+        while time.time() < deadline:
+            raw = self._ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if line.startswith("ANGLE:"):
+                return "acked"
+            if line.startswith("READY:"):
+                return "reset"
+            print(f"[serial] discard during dispense ack wait: {line!r}")
+        return "silent"
 
-        A monotonic sequence id is appended ("SET ANGLE <deg> <seq>") so firmware
-        that understands it can ignore a re-delivered duplicate (defence in depth);
-        older firmware ignores the trailing token and still dispenses exactly once.
+    def dispense(self, degrees) -> tuple[str, str]:
         """
-        timeout = self._ser.timeout or CMD_TIMEOUT
+        Execute one relative dispense move with EXACTLY-ONCE semantics and return
+        (outcome, detail). Outcomes:
+          "acked"    -- normal ack received; dispense confirmed.
+          "verified" -- ack lost, but GET STATUS proves the move executed.
+          "reset"    -- the board rebooted mid-move (READY banner or boot-id change).
+                        Dose is partial/unknown; NOTHING is re-sent (a re-send could
+                        double-dispense -> overflow). Caller may continue (under-dose).
+          "lost"     -- no ack AND no STATUS: the link itself is down.
+
+        SET ANGLE is NON-IDEMPOTENT (a relative move — re-running it dispenses again),
+        so a blind retry is forbidden; that blind retry was the original "dispensed
+        three times" overflow. A re-send happens ONLY with proof of non-execution: the
+        STATUS boot id is unchanged AND lastSeq still shows the previous dispense. Even
+        then the re-send reuses the SAME seq, so the firmware's seq-equality dedup keeps
+        the whole exchange at-most-once if the proof was stale.
+        """
         with self._lock:
             self._seq += 1
-            cmd = f"SET ANGLE {degrees} {self._seq}"
-            line = self._attempt(cmd, expect, timeout)
-            if line is None:
-                print(f"[serial] dispense got no ack (NOT retried): {cmd!r}")
-                return ""
-            return line
+            seq = self._seq
+            cmd = f"SET ANGLE {degrees} {seq}"
+            old_timeout = self._ser.timeout
+            try:
+                self._ser.timeout = 1.0   # fine-grained reads inside the wait loops
+                pre = self._read_status()  # boot-id baseline (None tolerated: old firmware)
+                for send_n in range(1, DISPENSE_MAX_SENDS + 1):
+                    self._ser.reset_input_buffer()
+                    self._ser.write((cmd + "\n").encode())
+                    self._ser.flush()
+                    res = self._await_dispense_ack(time.time() + DISPENSE_ACK_TIMEOUT_S)
+                    if res == "acked":
+                        return "acked", f"ack received (send {send_n})"
+                    if res == "reset":
+                        return ("reset", "board rebooted during the move (READY seen) -- "
+                                         "dose unknown, NOT re-sent")
+                    # Ack silent — verify instead of guessing. Probes are idempotent; if
+                    # the board is still mid-move they queue and are answered after.
+                    st = None
+                    probe_deadline = time.time() + STATUS_PROBE_BUDGET_S
+                    while st is None and time.time() < probe_deadline:
+                        st = self._read_status()
+                    if st is None:
+                        return "lost", f"no ack and no STATUS reply (send {send_n})"
+                    boot, last_seq = st
+                    if last_seq == seq:
+                        return "verified", f"ack lost; STATUS confirms seq {seq} executed"
+                    if pre is None:
+                        return ("lost", "ack lost and board continuity unverifiable "
+                                        "(no pre-dispense STATUS) -- NOT re-sent")
+                    if boot != pre[0]:
+                        return ("reset", "board rebooted during the move (boot id "
+                                         "changed) -- dose unknown, NOT re-sent")
+                    if last_seq != pre[1]:
+                        return ("lost", f"STATUS anomaly (lastSeq {last_seq}, expected "
+                                        f"{pre[1]} or {seq}) -- NOT re-sent")
+                    # Proven: same boot, dispense never executed -> same-seq re-send.
+                    print(f"[serial] dispense command lost (send {send_n}); "
+                          f"re-sending same seq {seq}")
+                return "lost", f"command not executed after {DISPENSE_MAX_SENDS} sends"
+            finally:
+                self._ser.timeout = old_timeout
 
     def close(self):
         try:
@@ -496,21 +581,22 @@ class CycleRunner:
             return False, "Stopped"
 
         status_cb(2, "Dispensing ~19 g...")
-        t0   = time.time()
-        # One-shot, never-retried dispense — a re-send would dispense again (overflow).
-        resp = d.dispense(360)
-        print(f"[serial] dispense 360 -> {resp!r}")
+        t0 = time.time()
+        outcome, detail = d.dispense(360)
         elapsed = time.time() - t0
-        if resp.startswith("ANGLE:"):
+        print(f"[serial] dispense 360 -> {outcome}: {detail}  ({elapsed:.1f}s)")
+        if outcome == "acked":
             step_label = f"Dispensed  ({elapsed:.1f}s)"
-        else:
-            # No / garbled ack. The dispense is sent EXACTLY ONCE and never retried, so a
-            # missing ack CANNOT cause a second dispense / overflow — continue the cycle
-            # instead of aborting the whole run on a transient serial hiccup. The ack wait
-            # has already elapsed, so the ~3.2 s move has completed; worst case is a single
-            # under-dosed cup, never an overflow.
-            step_label = f"Dispense -- no ack, continuing ({elapsed:.1f}s)"
-            print("[serial] dispense ack missing/garbled -- continuing (single-shot, no overflow risk)")
+        elif outcome == "verified":
+            step_label = f"Dispensed -- ack lost, verified by STATUS ({elapsed:.1f}s)"
+        elif outcome == "reset":
+            # The board rebooted mid-move; the dose is partial/unknown. dispense() never
+            # re-sends in this case (a re-send could double-dispense), so continuing is
+            # overflow-safe: one light cup beats an aborted overnight run.
+            step_label = "Dispenser reset mid-move -- dose may be partial, continuing"
+        else:  # "lost" — no ack AND no STATUS reply: the serial link itself is down,
+               # so later cycles would dispense nothing. Stop with a clear message.
+            return False, f"Dispense failed -- {detail}"
         if not self._step(2, step_label, status_cb, stop_flag, elapsed):
             return False, "Stopped"
 

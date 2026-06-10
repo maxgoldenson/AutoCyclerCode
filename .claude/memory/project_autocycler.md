@@ -12,15 +12,21 @@ Automated coffee machine cycler with two ESP32-based Arduino boards communicatin
 
 **Protocol (115200 baud, newline-terminated):**
 - `WHO AM I` → `IAM:DISPENSER` or `IAM:FRONT_ASSEMBLY`
-- DISPENSER: `SET ANGLE <deg> [<seq>]` → `ANGLE:<deg>`, `SET MOTOR ON/OFF` → `MOTOR:ON/OFF`
+- DISPENSER: `SET ANGLE <deg> [<seq>]` → `ANGLE:<deg>`,
+  `GET STATUS` → `STATUS:<bootId>,<lastSeq>,<lastDeg>`, `SET MOTOR ON/OFF` → `MOTOR:ON/OFF`
 - FRONT: `GET COLOR` → `RGB:r,g,b`, `SET SERVO <angle>` → `SERVO:<angle>`, `SET CAP ON/OFF` → `CAP:ON/OFF`
 - Both boards send `READY:<ID>` on startup (DTR reset triggers ~1.5 s boot delay)
 
-**Dispense safety (at-most-once):** `SET ANGLE` is a RELATIVE move, so executing it twice
-dispenses twice → overflow. The host (`SerialDevice.dispense()`) sends it EXACTLY ONCE,
-never retried (a lost ack aborts the cycle, fail-safe), and tags it with a monotonic
-`<seq>`. The DISPENSER firmware ignores a duplicate `<seq>` seen within a ~5 s window
-(re-send / RX-buffered frame) and re-acks without moving. The FRONT firmware has a CAP
+**Dispense safety (exactly-once with verification):** `SET ANGLE` is a RELATIVE move, so
+executing it twice dispenses twice → overflow. Motor EMI at ack time corrupted ~50% of
+acks in the field, so the host (`SerialDevice.dispense()`) verifies instead of guessing:
+send once (seq = session-random + monotonic) → if the ack is lost, poll `GET STATUS`.
+lastSeq == seq → dispense verified (continue); same bootId + lastSeq unchanged → command
+provably lost → ONE same-seq re-send (firmware dedups by seq equality, no time window);
+bootId changed or `READY:` seen mid-wait → board reset, dose unknown, NEVER re-sent
+(cycle continues, under-dose beats overflow); no STATUS at all → link down, run aborts.
+Firmware waits `ACK_SETTLE_MS` (75 ms) after the move before transmitting the ack so it
+isn't sent inside the motor's switching transients. The FRONT firmware has a CAP
 auto-release watchdog (`CAP_MAX_ON_MS`, 15 s) so the brew trigger can never stay asserted
 if the host dies. `CycleRunner.run_one()` always returns servo→REST and CAP→OFF on any exit.
 

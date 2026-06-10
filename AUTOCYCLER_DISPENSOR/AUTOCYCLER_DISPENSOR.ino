@@ -22,17 +22,18 @@ const float STEPS_PER_DEGREE = (STEPS_PER_REV * MICROSTEPPING) / 360.0f;
 // Reject absurd moves from a garbled command — a normal dispense is 360 deg.
 #define MAX_DISPENSE_DEG 1080.0f   // 3 revolutions
 
-// A re-sent / buffered-duplicate dispense arrives within a couple of seconds of the
-// original; the next legitimate cycle's dispense is always tens of seconds later. So
-// we only dedup a repeated seq seen inside this short window — this catches retries
-// and RX-buffered duplicates without ever suppressing a genuine new dispense (even
-// one that reuses a seq value after the host process restarts).
-#define DISPENSE_DEDUP_WINDOW_MS 5000UL
+// The ANGLE: ack used to be transmitted in the microseconds after the final step pulse,
+// while the driver/coils are still switching — motor EMI right on top of the UART frame
+// is the prime suspect for the ~50% corrupted/lost acks seen in the field (the FRONT
+// board has no motor and never showed the problem). Wait for the transients to die
+// before touching the UART.
+#define ACK_SETTLE_MS 75
 
 // ── State ──────────────────────────────────────────────────────────────────────
 bool motorEnabled = false;
-long lastDispenseSeq = -1;            // seq id of the last executed SET ANGLE
-unsigned long lastDispenseMillis = 0; // millis() when that dispense completed
+long lastDispenseSeq = -1;     // seq id of the last executed SET ANGLE (at-most-once)
+float lastDispenseDeg = 0.0f;  // degrees of that dispense (reported by GET STATUS)
+uint32_t bootId = 0;           // random per boot — lets the host detect a mid-move reset
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -137,10 +138,12 @@ void handleSetAngle(const String &args) {
         return;
     }
 
-    // At-most-once: a duplicate seq arriving within the dedup window means the host
-    // re-sent (or a frame was buffered during the blocking move). Ack without moving.
-    if (seq >= 0 && seq == lastDispenseSeq &&
-        (millis() - lastDispenseMillis) < DISPENSE_DEDUP_WINDOW_MS) {
+    // At-most-once: a repeated seq means the host deliberately re-sent because it could
+    // not verify execution (lost ack / lost command) — ack WITHOUT moving. Equality only,
+    // no time window: the host may legitimately re-send the same seq tens of seconds
+    // later (after its STATUS verification probes), and host seqs are session-random +
+    // monotonic, so a stale match across sessions is effectively impossible.
+    if (seq >= 0 && seq == lastDispenseSeq) {
         Serial.print("ANGLE:"); Serial.println(degrees);
         return;
     }
@@ -151,10 +154,34 @@ void handleSetAngle(const String &args) {
     stepDegrees(degrees);
     if (!wasEnabled) setMotorEnabled(false);
 
+    lastDispenseDeg = degrees;
     if (seq >= 0) lastDispenseSeq = seq;
-    lastDispenseMillis = millis();
+
+    // Let the motor/driver switching transients die down before transmitting — sending
+    // the ack in the same microseconds the coils de-energize is how acks get corrupted.
+    delay(ACK_SETTLE_MS);
 
     Serial.print("ANGLE:"); Serial.println(degrees);
+}
+
+/**
+ * GET STATUS
+ * Idempotent query the host uses to VERIFY a dispense when the ANGLE: ack was lost:
+ *   STATUS:<bootId>,<lastSeq>,<lastDeg>
+ * - bootId: random per boot. If it changes between two host queries, the board reset
+ *   (e.g. brownout mid-move) and any in-flight dispense state is unknowable.
+ * - lastSeq: seq of the last executed SET ANGLE (-1 = none since boot).
+ * If lastSeq matches what the host sent, the dispense happened and only the ack was
+ * lost; if not (same bootId), the command itself was lost and a same-seq re-send is
+ * safe (the equality dedup above makes it at-most-once).
+ */
+void handleGetStatus() {
+    Serial.print("STATUS:");
+    Serial.print(bootId);
+    Serial.print(",");
+    Serial.print(lastDispenseSeq);
+    Serial.print(",");
+    Serial.println(lastDispenseDeg);
 }
 
 /**
@@ -195,6 +222,12 @@ void dispatch(const String &raw) {
         if (noun == "AM I") handleWhoAmI();
         else { Serial.print("UNKNOWN:"); Serial.println(cmd); }
 
+    } else if (verb == "GET") {
+        String noun = rest;
+        noun.toUpperCase();
+        if (noun == "STATUS") handleGetStatus();
+        else { Serial.print("UNKNOWN:"); Serial.println(cmd); }
+
     } else if (verb == "SET") {
         int sp2     = rest.indexOf(' ');
         String noun = (sp2 < 0) ? rest            : rest.substring(0, sp2);
@@ -221,6 +254,11 @@ void setup() {
     pinMode(ENABLE_PIN, OUTPUT);
 
     setMotorEnabled(false);  // driver disabled at startup
+
+    // Random per-boot id (esp_random uses the hardware RNG). 0 is reserved for
+    // "unknown", so nudge it if the RNG ever returns 0.
+    bootId = (uint32_t)esp_random();
+    if (bootId == 0) bootId = 1;
 
     Serial.print("READY:"); Serial.println(DEVICE_ID);
 }
