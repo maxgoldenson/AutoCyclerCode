@@ -3,7 +3,7 @@ Tests for the launcher's update-detection and firmware flash-gating logic.
 
 No hardware, network, or arduino-cli needed: AUTOCYCLER_DIR is redirected to a temp
 dir, _fetch is stubbed to serve in-memory "remote" content, and the flash primitives
-(_have_arduino_cli / _probe_ports / _flash_one) are stubbed.
+(_have_arduino_cli / _probe_ports / _compile_board / _upload_board) are stubbed.
 
 The subtle, safety-relevant property under test: a firmware flash is gated on the
 "last successfully flashed" record, so a FAILED flash is retried next cycle instead of
@@ -54,8 +54,9 @@ def test_successful_flash_records_and_clears():
     launcher._have_arduino_cli = lambda: True
     launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0",
                                      "FRONT_ASSEMBLY": "/dev/ttyUSB1"}
+    launcher._compile_board = lambda board: True
     flashed = []
-    launcher._flash_one = lambda board, port: (flashed.append(board) or True)
+    launcher._upload_board = lambda board, port: (flashed.append(board) or True)
 
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert set(flashed) == {"DISPENSER", "FRONT_ASSEMBLY"}, flashed
@@ -73,14 +74,15 @@ def test_only_changed_board_reflashes():
 def test_failed_flash_is_retried():
     launcher._have_arduino_cli = lambda: True
     launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0"}
-    launcher._flash_one = lambda board, port: False   # simulate a flash failure
+    launcher._compile_board = lambda board: True
+    launcher._upload_board = lambda board, port: False   # simulate an upload failure
 
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert "DISPENSER" in launcher.fetch_firmware_changes(), \
         "failed flash must remain pending (retry), not be recorded"
 
     # Now succeed -> it clears.
-    launcher._flash_one = lambda board, port: True
+    launcher._upload_board = lambda board, port: True
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert launcher.fetch_firmware_changes() == {}
     print("PASS: failed flash is retried, then recorded on success")

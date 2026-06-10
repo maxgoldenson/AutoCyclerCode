@@ -2,30 +2,29 @@
 """
 Boot supervisor for the AutoCycler Pi — single entry point for startup.
 
-What it does
-------------
-1. Waits for the network at boot.
-2. Keeps coffee_cycler.py up to date: every CHECK_INTERVAL_S seconds it compares the
-   local copy against GitHub and, when a new version is published, downloads it and
-   restarts the app immediately so the new code runs without a reboot.
-3. Keeps the ESP32 firmware up to date: it watches both sketches; when one changes on
-   GitHub it stops the app (to free the serial ports), flashes the affected board(s)
-   from source with arduino-cli, then restarts the app.
-4. Supervises the app: if it ever exits, it is relaunched.
+Design priorities (in order):
+  1. The app UI comes up FIRST and stays up. Network waits and slow firmware compiles
+     happen in the background — the screen is never black waiting on them.
+  2. The supervisor NEVER exits. Every loop iteration is wrapped so a transient error
+     can't crash it into a restart loop (which would spawn duplicate apps fighting over
+     the serial ports).
+  3. Updates are applied without hanging: every external command (arduino-cli, network)
+     has a timeout, and the app is always restarted after a flash, success or fail.
 
-Firmware flashing is gated on a "last successfully flashed" record (flashed_firmware.json),
-NOT on the local .ino file, so a failed or skipped flash is retried on the next cycle
-instead of being silently lost.
+What it does:
+  - Launches coffee_cycler.py and relaunches it if it ever exits.
+  - Every CHECK_INTERVAL_S, if online, downloads a newer coffee_cycler.py and restarts
+    the app immediately.
+  - Watches both ESP32 sketches; on change it compiles from source (app stays up),
+    then briefly stops the app to free the serial ports, flashes the affected board(s)
+    with arduino-cli, and restarts the app.
 
-Pi prerequisites for firmware flashing (one-time):
-    arduino-cli core update-index
-    arduino-cli core install esp32:esp32
-    arduino-cli lib install "Adafruit TCS34725" "ESP32Servo"
-  arduino-cli must be on PATH (or set the ARDUINO_CLI env var). Override the board type
-  with ESP32_FQBN if your board isn't the generic esp32:esp32:esp32.
+Firmware flashing is gated on a "last successfully flashed" record
+(flashed_firmware.json) so a failed/skipped flash is retried, not lost.
 
-On the FIRST run (no flash record yet) both boards are flashed to the repo's current
-firmware to guarantee a known-good baseline; afterwards only genuine changes flash.
+Pi prerequisites for flashing (one-time) — see PI_SETUP.md:
+  arduino-cli + the ESP32 core (pin esp32:esp32@2.0.17 on Bullseye/Buster) + the
+  "Adafruit TCS34725" and "ESP32Servo" libraries.
 
 bootscript.py is a thin shim that just execs this file.
 """
@@ -74,14 +73,17 @@ FIRMWARE = {
 
 # ── Tunables ────────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_S = 60      # poll GitHub once a minute while booted
-NETWORK_TIMEOUT  = 180     # seconds to wait for the network at boot
+NETWORK_TIMEOUT  = 180     # seconds to wait for the network when we truly need it
 NETWORK_RETRY    = 5       # seconds between network checks
 HTTP_TIMEOUT     = 15      # per-request timeout
 SUPERVISE_TICK_S = 2       # how often the main loop wakes to supervise the app
 
-ARDUINO_CLI = os.environ.get("ARDUINO_CLI", "arduino-cli")
-ESP32_FQBN  = os.environ.get("ESP32_FQBN", "esp32:esp32:esp32")
-PROBE_BAUD  = 115200
+ARDUINO_CLI       = os.environ.get("ARDUINO_CLI", "arduino-cli")
+ESP32_FQBN        = os.environ.get("ESP32_FQBN", "esp32:esp32:esp32")
+PROBE_BAUD        = 115200
+CLI_VERSION_TO_S  = 20     # timeout for `arduino-cli version`
+COMPILE_TIMEOUT_S = 600    # ESP32 compile on a Pi can be slow
+UPLOAD_TIMEOUT_S  = 240    # flashing a board
 
 # ── Logging (resilient: console always, file if the dir is writable) ─────────────
 _handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -99,23 +101,29 @@ log = logging.getLogger("launcher")
 # =============================================================================
 #  Small helpers
 # =============================================================================
+def _network_up() -> bool:
+    """Single, fast connectivity probe (no retry loop) — safe to call in the main loop."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(("8.8.8.8", 53))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
 def wait_for_network() -> bool:
-    """Poll until a TCP connection to 8.8.8.8:53 succeeds or NETWORK_TIMEOUT expires.
-    A raw socket avoids depending on DNS resolution being ready."""
+    """Block until online or NETWORK_TIMEOUT expires. Only used when we genuinely cannot
+    proceed without the network (e.g. a fresh install with no app on disk yet)."""
     deadline = time.time() + NETWORK_TIMEOUT
     while time.time() < deadline:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3)
-            s.connect(("8.8.8.8", 53))
-            s.close()
+        if _network_up():
             log.info("Network ready.")
             return True
-        except OSError:
-            log.info("Waiting for network...")
-            time.sleep(NETWORK_RETRY)
-    log.warning("No network after %ss; continuing with local copies (will retry).",
-                NETWORK_TIMEOUT)
+        log.info("Waiting for network...")
+        time.sleep(NETWORK_RETRY)
+    log.warning("No network after %ss; continuing (will keep retrying).", NETWORK_TIMEOUT)
     return False
 
 
@@ -184,9 +192,9 @@ def check_app_update() -> bool:
 
 def fetch_firmware_changes() -> dict:
     """Return {board: remote_md5} for boards whose firmware differs from what was last
-    successfully flashed. Also refreshes the local .ino on disk (so arduino-cli compiles
-    the new source), but the flash decision is gated on the flashed record, not the file,
-    so a failed flash is retried rather than lost."""
+    successfully flashed. Refreshes the local .ino on disk (so arduino-cli compiles the
+    new source), but the flash decision is gated on the flashed record, not the file, so
+    a failed flash is retried rather than lost."""
     state = _load_flash_state()
     changes: dict = {}
     for board, info in FIRMWARE.items():
@@ -207,16 +215,57 @@ def fetch_firmware_changes() -> dict:
 # =============================================================================
 def _have_arduino_cli() -> bool:
     try:
-        subprocess.run([ARDUINO_CLI, "version"], capture_output=True, check=True)
+        subprocess.run([ARDUINO_CLI, "version"], capture_output=True,
+                       check=True, timeout=CLI_VERSION_TO_S)
         return True
     except Exception as e:
         log.warning("arduino-cli unavailable (%s).", e)
         return False
 
 
+def _compile_board(board: str) -> bool:
+    """Compile a board's sketch. Needs NO serial port, so the app can stay running."""
+    sketch_dir = FIRMWARE[board]["dir"]
+    try:
+        log.info("Compiling %s ...", board)
+        r = subprocess.run([ARDUINO_CLI, "compile", "--fqbn", ESP32_FQBN, sketch_dir],
+                           capture_output=True, text=True, timeout=COMPILE_TIMEOUT_S)
+        if r.returncode != 0:
+            log.error("Compile failed for %s:\n%s", board, (r.stderr or r.stdout).strip()[:1500])
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log.error("Compile timed out for %s after %ss.", board, COMPILE_TIMEOUT_S)
+        return False
+    except Exception as e:
+        log.error("Compile error for %s: %s", board, e)
+        return False
+
+
+def _upload_board(board: str, port: str) -> bool:
+    """Upload a board's (already-compiled) sketch. The app MUST be stopped first."""
+    sketch_dir = FIRMWARE[board]["dir"]
+    try:
+        log.info("Uploading %s -> %s ...", board, port)
+        r = subprocess.run([ARDUINO_CLI, "upload", "-p", port,
+                            "--fqbn", ESP32_FQBN, sketch_dir],
+                           capture_output=True, text=True, timeout=UPLOAD_TIMEOUT_S)
+        if r.returncode != 0:
+            log.error("Upload failed for %s:\n%s", board, (r.stderr or r.stdout).strip()[:1500])
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        log.error("Upload timed out for %s after %ss.", board, UPLOAD_TIMEOUT_S)
+        return False
+    except Exception as e:
+        log.error("Upload error for %s: %s", board, e)
+        return False
+
+
 def _probe_ports() -> dict:
     """Map board identity -> serial port by sending WHO AM I to each candidate port.
-    The app MUST be stopped (ports free) before calling this."""
+    The app MUST be stopped (ports free) before calling this, or you get
+    'multiple access on port' errors."""
     try:
         import serial
         import serial.tools.list_ports
@@ -250,54 +299,48 @@ def _probe_ports() -> dict:
     return mapping
 
 
-def _flash_one(board: str, port: str) -> bool:
-    """Compile and upload one board's sketch. Returns True only on a clean upload."""
-    sketch_dir = FIRMWARE[board]["dir"]
-    try:
-        log.info("Compiling %s (%s)...", board, sketch_dir)
-        r = subprocess.run([ARDUINO_CLI, "compile", "--fqbn", ESP32_FQBN, sketch_dir],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            log.error("Compile failed for %s:\n%s", board, (r.stderr or r.stdout).strip())
-            return False
-        log.info("Uploading %s -> %s ...", board, port)
-        r = subprocess.run([ARDUINO_CLI, "upload", "-p", port,
-                            "--fqbn", ESP32_FQBN, sketch_dir],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            log.error("Upload failed for %s:\n%s", board, (r.stderr or r.stdout).strip())
-            return False
-        return True
-    except Exception as e:
-        log.error("Flash error for %s: %s", board, e)
-        return False
-
-
-def flash_boards(changes: dict):
-    """Flash each changed board. The flashed record is updated ONLY on success, so a
-    failure (missing toolchain, no port, bad compile) is retried next cycle. Call with
-    the app stopped so the serial ports are free."""
+def flash_boards(changes: dict, app=None):
+    """Flash each changed board. Compile happens with the app still running (no port
+    needed); only the brief upload requires the app stopped. The flashed record is
+    updated ONLY on a successful upload, so any failure is retried next cycle. The app
+    is always restarted afterwards (finally)."""
     if not changes:
         return
     if not _have_arduino_cli():
         log.warning("Firmware changed for %s but arduino-cli is unavailable; will retry "
                     "next cycle.", ", ".join(changes))
         return
-    mapping = _probe_ports()
-    state = _load_flash_state()
+
+    # 1. Compile first — slow part, done while the UI is still up.
+    compiled: dict = {}
     for board, md5 in changes.items():
-        port = mapping.get(board)
-        if not port:
-            log.error("Could not find the serial port for %s; will retry next cycle.", board)
-            continue
-        if _flash_one(board, port):
-            state[board] = md5
-            _save_flash_state(state)
-            log.info("Flashed %s successfully (recorded %s).", board, md5[:8])
-        else:
-            log.error("Flash failed for %s; will retry next cycle.", board)
-    # Give freshly-flashed boards a moment to reboot before the app reconnects.
-    time.sleep(2)
+        if _compile_board(board):
+            compiled[board] = md5
+    if not compiled:
+        return
+
+    # 2. Stop the app to free the serial ports, then probe + upload, then restart.
+    if app is not None:
+        app.stop()
+        time.sleep(1)   # let the OS release the port fds / USB settle
+    try:
+        mapping = _probe_ports()
+        state = _load_flash_state()
+        for board, md5 in compiled.items():
+            port = mapping.get(board)
+            if not port:
+                log.error("No serial port found for %s; will retry next cycle.", board)
+                continue
+            if _upload_board(board, port):
+                state[board] = md5
+                _save_flash_state(state)
+                log.info("Flashed %s successfully (recorded %s).", board, md5[:8])
+            else:
+                log.error("Upload failed for %s; will retry next cycle.", board)
+    finally:
+        if app is not None:
+            time.sleep(2)   # give freshly-flashed boards a moment to reboot
+            app.start()
 
 
 # =============================================================================
@@ -314,12 +357,16 @@ class App:
         if self.running():
             return
         if not os.path.exists(LOCAL_SCRIPT):
-            log.error("No app at %s; cannot start.", LOCAL_SCRIPT)
+            log.error("No app at %s; cannot start yet.", LOCAL_SCRIPT)
             return
         env = os.environ.copy()
         env["AUTOCYCLER_FULLSCREEN"] = "1"
-        log.info("Launching app.")
-        self.proc = subprocess.Popen([sys.executable, LOCAL_SCRIPT], env=env)
+        try:
+            self.proc = subprocess.Popen([sys.executable, LOCAL_SCRIPT], env=env)
+            log.info("Launched app (pid %s).", self.proc.pid)
+        except Exception as e:
+            log.error("Failed to launch app: %s", e)
+            self.proc = None
 
     def stop(self, timeout: float = 10.0):
         if self.proc and self.proc.poll() is None:
@@ -330,64 +377,64 @@ class App:
             except subprocess.TimeoutExpired:
                 log.warning("App did not exit in %ss; killing.", timeout)
                 self.proc.kill()
-                self.proc.wait()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         self.proc = None
 
 
 def _apply_updates(app: App):
-    """One update cycle: app first (download + immediate restart), then firmware
-    (stop, flash, restart). Both stop/start the app at most once."""
-    app_changed = check_app_update()
-    fw_changes  = fetch_firmware_changes()
+    """One update cycle. App update => download + immediate restart. Firmware change =>
+    compile (app up), then brief stop to upload, then restart."""
+    if check_app_update():
+        log.info("New app version — restarting app.")
+        app.stop()
+        app.start()
 
-    if not app_changed and not fw_changes:
-        return
-
-    if app_changed:
-        log.info("New app version detected — restarting immediately.")
+    fw_changes = fetch_firmware_changes()
     if fw_changes:
-        log.info("New firmware detected for %s — flashing.", ", ".join(fw_changes))
-
-    # Any change needs at least an app restart; firmware also needs the ports free.
-    app.stop()
-    flash_boards(fw_changes)
-    app.start()
-    log.info("Update cycle applied; app restarted.")
+        log.info("New firmware for %s — flashing.", ", ".join(fw_changes))
+        flash_boards(fw_changes, app)
 
 
 def main():
-    online = wait_for_network()
     app = App()
 
-    # Initial sync before the first launch so boot always runs the latest, and the
-    # boards are flashed (first run flashes both to establish a known-good baseline).
-    if online:
+    # If there is no app on disk yet (fresh install) we can't show anything until we
+    # download it — only then do we block on the network.
+    if not os.path.exists(LOCAL_SCRIPT):
+        log.info("No local app yet; fetching before first launch.")
+        wait_for_network()
         try:
             check_app_update()
-            flash_boards(fetch_firmware_changes())   # app not running yet — ports free
         except Exception as e:
-            log.warning("Initial sync failed: %s", e)
+            log.warning("Initial app fetch failed: %s", e)
 
+    # Bring the UI up immediately — the screen is never black waiting on the network or
+    # a firmware compile.
     app.start()
+    log.info("Supervisor running.")
 
-    last_check = time.time()
-    try:
-        while True:
+    last_check = 0.0   # 0 => run the first update check as soon as we're online
+    while True:
+        try:
             if not app.running():
-                log.warning("App is not running — relaunching.")
+                log.warning("App not running — relaunching.")
                 app.start()
-
             if time.time() - last_check >= CHECK_INTERVAL_S:
                 last_check = time.time()
-                try:
+                if _network_up():
                     _apply_updates(app)
-                except Exception as e:
-                    log.warning("Update cycle errored (continuing): %s", e)
-
-            time.sleep(SUPERVISE_TICK_S)
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Supervisor exiting; stopping app.")
-        app.stop()
+        except (KeyboardInterrupt, SystemExit):
+            log.info("Supervisor exiting; stopping app.")
+            app.stop()
+            return
+        except Exception as e:
+            # Never die: a transient error must not turn into a restart loop that
+            # spawns duplicate apps fighting over the serial ports.
+            log.warning("Supervisor loop error (continuing): %s", e)
+        time.sleep(SUPERVISE_TICK_S)
 
 
 if __name__ == "__main__":
