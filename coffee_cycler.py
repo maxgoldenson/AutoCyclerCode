@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-10 22:28"
+VERSION = "2026-06-10 22:54"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -195,10 +195,11 @@ class SerialDevice:
 
         This command is NON-IDEMPOTENT: each execution steps the motor another
         `degrees`, dispensing more coffee. It is therefore sent EXACTLY ONCE and is
-        NEVER retried — a lost ack must abort the cycle (fail-safe) rather than risk a
-        second dispense and an overflow. (This was the root cause of the observed
-        "dispensed three times" failure: send()'s retry loop re-issued SET ANGLE up
-        to three times when an ack was lost.)
+        NEVER retried — re-sending is what caused the original "dispensed three times"
+        overflow (send()'s retry loop re-issued SET ANGLE when an ack was lost). Because
+        it is single-shot, a missing/garbled ack can NOT cause a double dispense, so the
+        caller may safely continue the cycle on a lost ack (worst case: one under-dosed
+        cup) rather than aborting the whole run.
 
         A monotonic sequence id is appended ("SET ANGLE <deg> <seq>") so firmware
         that understands it can ignore a re-delivered duplicate (defence in depth);
@@ -496,14 +497,21 @@ class CycleRunner:
 
         status_cb(2, "Dispensing ~19 g...")
         t0   = time.time()
-        # One-shot, never-retried dispense. A lost ack aborts the cycle (fail-safe)
-        # rather than re-sending and risking a second dispense / overflow.
+        # One-shot, never-retried dispense — a re-send would dispense again (overflow).
         resp = d.dispense(360)
         print(f"[serial] dispense 360 -> {resp!r}")
         elapsed = time.time() - t0
-        if not resp.startswith("ANGLE:"):
-            return False, f"Dispense failed (not retried for safety): {resp or '(no response)'}"
-        if not self._step(2, f"Dispensed  ({elapsed:.1f}s)", status_cb, stop_flag, elapsed):
+        if resp.startswith("ANGLE:"):
+            step_label = f"Dispensed  ({elapsed:.1f}s)"
+        else:
+            # No / garbled ack. The dispense is sent EXACTLY ONCE and never retried, so a
+            # missing ack CANNOT cause a second dispense / overflow — continue the cycle
+            # instead of aborting the whole run on a transient serial hiccup. The ack wait
+            # has already elapsed, so the ~3.2 s move has completed; worst case is a single
+            # under-dosed cup, never an overflow.
+            step_label = f"Dispense -- no ack, continuing ({elapsed:.1f}s)"
+            print("[serial] dispense ack missing/garbled -- continuing (single-shot, no overflow risk)")
+        if not self._step(2, step_label, status_cb, stop_flag, elapsed):
             return False, "Stopped"
 
         status_cb(3, "Opening gate...")
