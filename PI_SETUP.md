@@ -58,11 +58,15 @@ Without this, the app auto-update still works; firmware flashing is just skipped
 retried each minute until the toolchain is present (you'll see a warning in the log).
 
 ```bash
-# 3a. Install arduino-cli (ARM build auto-detected) and put it on PATH
-cd /home/pi
-curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-sudo mv /home/pi/bin/arduino-cli /usr/local/bin/
-arduino-cli version    # sanity check
+# 3a. Install arduino-cli (ARM build auto-detected) straight onto PATH.
+# NOTE: the installer drops the binary in ./bin of the CURRENT directory unless you
+# set BINDIR — so we force /usr/local/bin to avoid PATH surprises.
+curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sudo BINDIR=/usr/local/bin sh
+arduino-cli version    # sanity check (expect 1.5.x)
+
+# If you already ran the installer without BINDIR, the binary is in ./bin of wherever
+# you ran it (e.g. /home/pi/autocycler/bin). Just move it onto PATH instead:
+#   sudo mv /home/pi/autocycler/bin/arduino-cli /usr/local/bin/
 
 # 3b. Add the ESP32 board package and install the core
 arduino-cli config init
