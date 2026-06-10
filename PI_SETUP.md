@@ -1,5 +1,28 @@
 # Pi deployment guide — auto-update + ESP32 firmware flashing
 
+## Quick install (recommended)
+
+One script does everything below — toolchain, libraries, code, autostart. Run it on the
+Pi as the `pi` user:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/claude/wonderful-allen-o1258o/pi_install.sh | bash
+sudo reboot
+```
+
+It is safe to re-run. Override defaults with env vars, e.g.
+`AUTOCYCLER_BRANCH=main ESP32_FQBN=esp32:esp32:esp32doit-devkit-v1 bash pi_install.sh`.
+The manual steps below are kept for reference / troubleshooting.
+
+### What it handles for partial / missing devices
+- The app UI comes up first and **auto-reconnects** as boards are plugged in — works with
+  two, one, or zero modules connected at boot.
+- Firmware is flashed **only for boards that are actually connected**. If a module isn't
+  plugged in, the launcher waits and flashes it automatically once you connect it.
+- A full-screen **"Updating firmware — please wait"** message shows during flashing.
+
+---
+
 This covers the one-time changes on the Raspberry Pi to run the new `launcher.py`
 (minute-poll app auto-update + over-the-air ESP32 firmware flashing).
 

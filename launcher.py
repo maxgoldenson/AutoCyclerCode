@@ -43,10 +43,12 @@ import urllib.request
 # ── Paths ───────────────────────────────────────────────────────────────────────
 # AUTOCYCLER_DIR lets the install location be overridden (and makes this testable);
 # defaults to the Pi deployment path.
-APP_DIR      = os.environ.get("AUTOCYCLER_DIR", "/home/pi/autocycler")
-LOCAL_SCRIPT = os.path.join(APP_DIR, "coffee_cycler.py")
-FLASH_STATE  = os.path.join(APP_DIR, "flashed_firmware.json")
-LOG_PATH     = os.path.join(APP_DIR, "launcher.log")
+APP_DIR       = os.environ.get("AUTOCYCLER_DIR", "/home/pi/autocycler")
+LOCAL_SCRIPT  = os.path.join(APP_DIR, "coffee_cycler.py")
+FLASH_STATE   = os.path.join(APP_DIR, "flashed_firmware.json")
+LOG_PATH      = os.path.join(APP_DIR, "launcher.log")
+STATUS_FILE   = os.path.join(APP_DIR, "launcher_status.txt")   # human-readable state
+SPLASH_SCRIPT = os.path.join(APP_DIR, "flash_splash.py")       # "please wait" screen
 
 # ── Repo / URLs ─────────────────────────────────────────────────────────────────
 # Branch the Pi polls for app + firmware updates. Override on the Pi with the
@@ -84,6 +86,8 @@ PROBE_BAUD        = 115200
 CLI_VERSION_TO_S  = 20     # timeout for `arduino-cli version`
 COMPILE_TIMEOUT_S = 600    # ESP32 compile on a Pi can be slow
 UPLOAD_TIMEOUT_S  = 240    # flashing a board
+FLASH_BACKOFF_S   = 300    # don't re-attempt a pending flash more often than this while
+                           # the USB topology is unchanged (avoids disrupting the app)
 
 # ── Logging (resilient: console always, file if the dir is writable) ─────────────
 _handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -299,11 +303,65 @@ def _probe_ports() -> dict:
     return mapping
 
 
+def _list_serial_ports() -> list:
+    """Enumerate candidate serial ports WITHOUT opening them — a cheap presence check
+    for 'is any USB module plugged in?'."""
+    try:
+        import serial.tools.list_ports
+        return [p.device for p in serial.tools.list_ports.comports()]
+    except Exception as e:
+        log.warning("Could not list serial ports: %s", e)
+        return []
+
+
+def _write_status(msg: str):
+    """Record a human-readable status line (best effort) for visibility."""
+    try:
+        _write_atomic(STATUS_FILE, (msg + "\n").encode())
+    except Exception:
+        pass
+
+
+def _show_splash(msg: str):
+    """Best-effort fullscreen 'please wait' window during flashing. Returns Popen|None."""
+    if not os.path.exists(SPLASH_SCRIPT):
+        return None
+    try:
+        return subprocess.Popen([sys.executable, SPLASH_SCRIPT, msg], env=os.environ.copy())
+    except Exception as e:
+        log.info("Splash unavailable: %s", e)
+        return None
+
+
+def _hide_splash(proc):
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        pass
+
+
+# Track USB topology so we don't stop the app to re-probe every minute while waiting for
+# an absent board — we only retry on a plug/unplug event or after a backoff.
+_last_flash_ports: list | None = None
+_last_flash_attempt: float = 0.0
+
+
 def flash_boards(changes: dict, app=None):
-    """Flash each changed board. Compile happens with the app still running (no port
-    needed); only the brief upload requires the app stopped. The flashed record is
-    updated ONLY on a successful upload, so any failure is retried next cycle. The app
-    is always restarted afterwards (finally)."""
+    """Flash changed boards that are actually connected. Handling for missing modules:
+      - No USB serial devices present at all -> wait + inform; the app is NOT disturbed.
+      - Some present -> flash the ones we can identify; any changed board that is absent
+        is deferred with a clear 'waiting for <board>' note and retried later.
+    Compile happens with the app up; the app is stopped only for the brief upload and is
+    always restarted (finally). A fullscreen 'please wait' splash shows during flashing.
+    The flashed record updates ONLY on a successful upload, so failures/absences retry."""
+    global _last_flash_ports, _last_flash_attempt
     if not changes:
         return
     if not _have_arduino_cli():
@@ -311,7 +369,23 @@ def flash_boards(changes: dict, app=None):
                     "next cycle.", ", ".join(changes))
         return
 
-    # 1. Compile first — slow part, done while the UI is still up.
+    ports = sorted(_list_serial_ports())
+    if not ports:
+        msg = ("Firmware update ready for %s — waiting for the USB module(s) to be "
+               "plugged in. Flashing starts automatically once connected."
+               % ", ".join(sorted(changes)))
+        log.info(msg)
+        _write_status(msg)
+        return
+
+    # Throttle: while the set of connected USB ports is unchanged, don't keep stopping
+    # the app to re-probe — only retry on a plug/unplug event or after a backoff.
+    if ports == _last_flash_ports and (time.time() - _last_flash_attempt) < FLASH_BACKOFF_S:
+        return
+    _last_flash_ports = ports
+    _last_flash_attempt = time.time()
+
+    # Compile first — the slow part — while the app UI is still up (no port needed).
     compiled: dict = {}
     for board, md5 in changes.items():
         if _compile_board(board):
@@ -319,25 +393,31 @@ def flash_boards(changes: dict, app=None):
     if not compiled:
         return
 
-    # 2. Stop the app to free the serial ports, then probe + upload, then restart.
+    # Stop the app to free the ports, show a 'please wait' splash, then probe + upload.
+    splash = None
     if app is not None:
         app.stop()
         time.sleep(1)   # let the OS release the port fds / USB settle
+        splash = _show_splash("Updating firmware…\nPlease wait — this takes a minute.")
     try:
         mapping = _probe_ports()
         state = _load_flash_state()
         for board, md5 in compiled.items():
             port = mapping.get(board)
             if not port:
-                log.error("No serial port found for %s; will retry next cycle.", board)
+                msg = "Waiting for %s to be connected before flashing its firmware." % board
+                log.info(msg)
+                _write_status(msg)
                 continue
             if _upload_board(board, port):
                 state[board] = md5
                 _save_flash_state(state)
                 log.info("Flashed %s successfully (recorded %s).", board, md5[:8])
+                _write_status("Flashed %s successfully." % board)
             else:
                 log.error("Upload failed for %s; will retry next cycle.", board)
     finally:
+        _hide_splash(splash)
         if app is not None:
             time.sleep(2)   # give freshly-flashed boards a moment to reboot
             app.start()

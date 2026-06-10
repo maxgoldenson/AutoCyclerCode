@@ -48,7 +48,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-10 19:50"
+VERSION = "2026-06-10 21:39"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +59,7 @@ BAUD_RATE         = 115200
 DISCOVERY_TIMEOUT = 4.0
 CMD_TIMEOUT       = 15.0
 BOOT_TIMEOUT      = 4.0
+AUTO_RECONNECT_S  = 15.0   # idle re-scan interval when devices aren't connected yet
 
 # -- Device IDs ----------------------------------------------------------------
 ID_DISPENSER = "DISPENSER"
@@ -568,6 +569,8 @@ class CoffeeCyclerApp:
         self._maintenance_resume.set()
         self.start_time: Optional[float] = None
         self.runner: Optional[object] = None   # live CycleRunner, used by _tick for adaptive ETA
+        self._discovering         = False      # a discovery scan is in progress
+        self._last_auto_discovery = 0.0        # last time idle auto-reconnect fired
 
         # Pendant state
         self._pend_labels: dict = {}           # idx → tk.Label whose fg turns green when focused
@@ -1051,23 +1054,32 @@ class CoffeeCyclerApp:
     #  Device discovery
     # =========================================================================
     def _start_discovery(self):
+        if self._discovering:
+            return  # a scan is already running — don't stack them
+        self._discovering = True
         self.reconnect_btn.configure(state="disabled")
         self.start_btn.configure(state="disabled")
         self._set_conn("Scanning for devices...", self.MUTED)
         threading.Thread(target=self._discovery_worker, daemon=True).start()
 
     def _discovery_worker(self):
-        ok, msg = self.devices.discover(
-            status_cb=lambda s: self.root.after(0, lambda m=s: self._set_conn(m, self.MUTED))
-        )
-        if ok:
-            resp = self.devices.front.send(f"SET SERVO {SERVO_REST}")
-            print(f"[boot] SET SERVO {SERVO_REST} -> {resp!r}")
-            resp_cap = self.devices.front.send("SET CAP OFF", expect="CAP:")
-            print(f"[boot] SET CAP OFF -> {resp_cap!r}")
+        try:
+            ok, msg = self.devices.discover(
+                status_cb=lambda s: self.root.after(0, lambda m=s: self._set_conn(m, self.MUTED))
+            )
+            if ok:
+                resp = self.devices.front.send(f"SET SERVO {SERVO_REST}")
+                print(f"[boot] SET SERVO {SERVO_REST} -> {resp!r}")
+                resp_cap = self.devices.front.send("SET CAP OFF", expect="CAP:")
+                print(f"[boot] SET CAP OFF -> {resp_cap!r}")
+        except Exception as e:
+            # Never let a discovery error wedge the auto-reconnect (it would leave
+            # _discovering stuck True). Report it and let the next scan retry.
+            ok, msg = False, f"Discovery error: {e}"
         self.root.after(0, lambda: self._on_discovery_done(ok, msg))
 
     def _on_discovery_done(self, ok: bool, msg: str):
+        self._discovering = False
         self.reconnect_btn.configure(state="normal")
         if ok:
             self._set_conn(msg, self.SUCCESS)
@@ -1075,7 +1087,8 @@ class CoffeeCyclerApp:
             self.start_btn.configure(state="normal")
         else:
             self._set_conn(f"Connection failed: {msg}", self.DANGER)
-            self._set_status("Could not connect to devices.", self.DANGER)
+            self._set_status("Waiting for devices -- plug in the USB module(s); "
+                             "retrying automatically.", self.WARNING)
 
     def _set_conn(self, text: str, color: str):
         self.conn_var.set(text)
@@ -1477,6 +1490,16 @@ class CoffeeCyclerApp:
         self.status_label.configure(fg=color)
 
     def _tick(self):
+        # Auto-reconnect when idle and not connected, so the kiosk recovers on its own
+        # once the USB module(s) are plugged in — no manual Reconnect needed. Works with
+        # one, both, or no devices present; it just keeps retrying until both are found.
+        cycle_running = self.cycle_thread is not None and self.cycle_thread.is_alive()
+        if (not self.devices.ready and not self._discovering and not self._starting
+                and not cycle_running
+                and time.time() - self._last_auto_discovery > AUTO_RECONNECT_S):
+            self._last_auto_discovery = time.time()
+            self._start_discovery()
+
         if self.start_time and self.cycle_thread and self.cycle_thread.is_alive():
             elapsed = int(time.time() - self.start_time)
             self.elapsed_value.set(self._fmt_time(elapsed))

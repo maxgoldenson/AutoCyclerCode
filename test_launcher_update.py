@@ -30,6 +30,15 @@ _REMOTE = {
 }
 launcher._fetch = lambda url: _REMOTE.get(url)
 
+# By default pretend two USB modules are plugged in; individual tests override this.
+launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+
+
+def _reset_flash_throttle():
+    """Clear the launcher's USB-topology throttle so a test can flash deterministically."""
+    launcher._last_flash_ports = None
+    launcher._last_flash_attempt = 0.0
+
 
 def test_app_update_detection():
     assert launcher.check_app_update() is True, "first sync should download the app"
@@ -58,6 +67,7 @@ def test_successful_flash_records_and_clears():
     flashed = []
     launcher._upload_board = lambda board, port: (flashed.append(board) or True)
 
+    _reset_flash_throttle()
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert set(flashed) == {"DISPENSER", "FRONT_ASSEMBLY"}, flashed
     assert launcher.fetch_firmware_changes() == {}, "recorded flashes should clear changes"
@@ -77,15 +87,34 @@ def test_failed_flash_is_retried():
     launcher._compile_board = lambda board: True
     launcher._upload_board = lambda board, port: False   # simulate an upload failure
 
+    _reset_flash_throttle()
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert "DISPENSER" in launcher.fetch_firmware_changes(), \
         "failed flash must remain pending (retry), not be recorded"
 
     # Now succeed -> it clears.
     launcher._upload_board = lambda board, port: True
+    _reset_flash_throttle()
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert launcher.fetch_firmware_changes() == {}
     print("PASS: failed flash is retried, then recorded on success")
+
+
+def test_no_devices_present_defers_flash():
+    _REMOTE[launcher.FIRMWARE["DISPENSER"]["url"]] = b"DISPENSER FW V9"
+    launcher._have_arduino_cli = lambda: True
+    launcher._list_serial_ports = lambda: []          # nothing plugged in
+    compiled = []
+    launcher._compile_board = lambda b: (compiled.append(b) or True)
+
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())
+    assert compiled == [], "must not compile/flash with no USB modules present"
+    assert "DISPENSER" in launcher.fetch_firmware_changes(), "flash stays pending"
+
+    # Restore the default 'two modules present' for any later use.
+    launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+    print("PASS: no USB modules present -> flash deferred, app untouched")
 
 
 def test_missing_toolchain_does_not_record():
@@ -105,6 +134,7 @@ if __name__ == "__main__":
         test_successful_flash_records_and_clears,
         test_only_changed_board_reflashes,
         test_failed_flash_is_retried,
+        test_no_devices_present_defers_flash,
         test_missing_toolchain_does_not_record,
     ]
     failed = 0
