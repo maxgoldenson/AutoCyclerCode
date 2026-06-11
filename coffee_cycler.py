@@ -49,7 +49,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-11 16:04"
+VERSION = "2026-06-11 16:52"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -156,10 +156,19 @@ class SerialDevice:
             rtscts=False,    # disable hardware flow control — not needed and causes issues on some chips
             exclusive=_EXCLUSIVE,  # refuse to share the port — guards against a 2nd app instance
         )
-        time.sleep(0.1)      # let USB-serial enumeration settle before first byte
-        _wait_for_ready(self._ser)
-        self._ser.timeout = timeout
-        self._ser.reset_input_buffer()
+        try:
+            time.sleep(0.1)      # let USB-serial enumeration settle before first byte
+            _wait_for_ready(self._ser)
+            self._ser.timeout = timeout
+            self._ser.reset_input_buffer()
+        except Exception:
+            # If setup fails, close so we don't leak the (exclusive-locked) port — the
+            # caller never gets a reference to close it.
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            raise
 
     def _attempt(self, cmd: str, expect: Optional[str], timeout: float) -> Optional[str]:
         """
@@ -337,6 +346,7 @@ class DeviceManager:
             pass
 
     def _probe(self, port: str) -> Optional[str]:
+        s = None
         try:
             s = serial.Serial(port, BAUD_RATE, timeout=1.0, exclusive=_EXCLUSIVE)
             _wait_for_ready(s)
@@ -344,11 +354,19 @@ class DeviceManager:
             s.write(b"WHO AM I\n")
             s.timeout = DISCOVERY_TIMEOUT
             resp = s.readline().decode("utf-8", errors="replace").strip()
-            s.close()
             if resp.startswith("IAM:"):
                 return resp[4:]
         except Exception:
             pass
+        finally:
+            # ALWAYS close — a leaked open port keeps its exclusive lock, which would
+            # block every future probe of this port until the process restarts (the old
+            # "stuck until reboot" failure).
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
         return None
 
     def discover(self, status_cb=None) -> tuple[bool, str]:

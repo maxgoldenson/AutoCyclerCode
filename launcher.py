@@ -341,29 +341,19 @@ def _upload_board(board: str, port: str) -> bool:
         return False
 
 
-def _reset_board_run_mode(port: str):
-    """Hard-reset an ESP32 into RUN mode after flashing (esptool's classic reset: DTR
-    de-asserted = GPIO0 high = run, then pulse RTS = EN/reset). Without this the board
-    can sit in the download bootloader after a flash — not running the new firmware and
-    not answering WHO AM I — until a power cycle/reboot. The app deliberately never
-    toggles DTR/RTS, so the launcher must do it here."""
+def _reboot_pi():
+    """Reboot the Pi — the known-good way to bring freshly-flashed ESP32 boards back
+    online (the auto-reset after flashing isn't dependable on this hardware). Safe from a
+    reboot loop: the flashed FW_VERSIONs are recorded BEFORE we get here, so after the
+    reboot nothing needs flashing. Returns False if the reboot couldn't be issued."""
     try:
-        import serial
-    except Exception:
-        return
-    try:
-        s = serial.Serial(port)
-        try:
-            s.dtr = False    # GPIO0 high -> run mode (NOT the download bootloader)
-            s.rts = True     # EN low     -> hold in reset
-            time.sleep(0.1)
-            s.rts = False    # EN high    -> release -> boots the new firmware
-            time.sleep(0.3)
-        finally:
-            s.close()
-        log.info("Reset %s into run mode after flashing.", port)
+        os.sync()   # make sure flashed_firmware.json is on disk before we go down
+        subprocess.run(["sudo", "reboot"], timeout=20)
+        time.sleep(45)   # block here until the shutdown takes us down
+        return True
     except Exception as e:
-        log.info("Post-flash reset of %s skipped: %s", port, e)
+        log.error("Reboot could not be issued (%s).", e)
+        return False
 
 
 class _ProbeTimeout(Exception):
@@ -567,6 +557,7 @@ def flash_boards(changes: dict, app=None):
         return
 
     # Stop the app to free the ports, then probe + upload.
+    flashed_any = False   # set True on a successful upload -> reboot to bring boards online
     if app is not None:
         app.stop()
         kill_stray_apps()    # kill any orphan coffee_cycler.py by name
@@ -605,10 +596,9 @@ def flash_boards(changes: dict, app=None):
                 continue
             phase[board] = "flashing… (do not power off)"; push()
             if _upload_board(board, port):
-                phase[board] = "starting new firmware…"; push()
-                _reset_board_run_mode(port)   # boot it now, not after a reboot
                 state[board] = tag
-                _save_flash_state(state)
+                _save_flash_state(state)   # record BEFORE the reboot -> no reboot loop
+                flashed_any = True
                 phase[board] = f"updated  ✓  v{tag}"; push()
                 log.info("Flashed %s successfully (recorded version %s).", board, tag)
                 _write_status("Flashed %s successfully (version %s)." % (board, tag))
@@ -616,15 +606,29 @@ def flash_boards(changes: dict, app=None):
                 phase[board] = "flash FAILED — will retry"; push()
                 log.error("Upload failed for %s; will retry next cycle.", board)
         if splash is not None:
-            # Hold the final result (the flashed versions) on screen so the operator can
-            # read what was installed before the app comes back.
-            push("Firmware update complete", "Returning to the app…")
+            # Hold the result on screen so the operator can read the flashed versions.
+            if flashed_any:
+                push("Firmware updated", "Rebooting to bring the boards online…")
+            else:
+                push("Firmware update complete", "Returning to the app…")
             time.sleep(SUMMARY_HOLD_S)
     finally:
-        _hide_splash(splash)
-        if app is not None:
-            time.sleep(2)   # give freshly-flashed boards a moment to reboot
-            app.start()
+        # Only reboot when actually supervising an app (real Pi). app is None in tests
+        # and any headless call, where we must never reboot the host.
+        if flashed_any and app is not None:
+            # Freshly-flashed boards reliably come back only after a reboot. The new
+            # versions are already recorded, so this won't loop. Leave the "rebooting…"
+            # splash up — the reboot tears everything down.
+            log.info("Firmware flashed — rebooting to bring the boards online.")
+            if not _reboot_pi():            # couldn't reboot (e.g. no passwordless sudo)
+                _hide_splash(splash)
+                time.sleep(2)
+                app.start()
+        else:
+            _hide_splash(splash)
+            if app is not None:
+                time.sleep(2)
+                app.start()
 
 
 # =============================================================================

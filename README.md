@@ -40,7 +40,7 @@ you never have to touch the Pi again:
 |------|-----------------|
 | **App** (`coffee_cycler.py`) | a new version is on `main` → downloads, restarts the app |
 | **Launcher** itself | `launcher.py` changed → self-updates and relaunches |
-| **ESP32 firmware** | a board's `FW_VERSION` changed → compiles + flashes it, shows a live progress screen, then boots the board into the new firmware |
+| **ESP32 firmware** | a board's `FW_VERSION` changed → compiles + flashes it (live progress screen), then **reboots the Pi** to bring the board up on the new firmware (the version is recorded first, so it won't loop) |
 
 ---
 
@@ -104,7 +104,7 @@ uptime; ps -o pid,etime,cmd -C python3 # is it stable? (not a reboot loop)
 | Board won't connect / `device reports readiness… returned no data` | ModemManager grabbing the port — the installer disables it; re-run it. |
 | Header shows `ESP32 fw … ?` for a board | That board is on old firmware without the version query; it updates on the next flash. |
 | "Keeps flashing every few minutes" | Either a real `FW_VERSION` bump (one flash, then stops) or an upload is failing — the log line `… needs flashing: version X (on board: Y)` shows which. |
-| Board offline until you reboot, after a flash | Fixed: the launcher now resets the board into run mode after flashing. Old launchers need one reboot (then Section 5). |
+| Screen reboots right after a firmware flash | Expected — the Pi auto-reboots after flashing to reliably bring the boards back online. It records the version first, so it won't loop. (Needs passwordless `sudo`, the Pi default.) |
 
 ---
 

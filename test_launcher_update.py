@@ -33,6 +33,10 @@ launcher._fetch = lambda url: _REMOTE.get(url)
 # By default pretend two USB modules are plugged in; individual tests override this.
 launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
 
+# Safety net: never let a test actually reboot the host (flash_boards only reboots when
+# app is not None, but stub it anyway so a logic slip can't take the machine down).
+launcher._reboot_pi = lambda: True
+
 
 def _reset_flash_throttle():
     """Clear the launcher's USB-topology throttle so a test can flash deterministically."""

@@ -53,8 +53,17 @@ curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/main/pi
 Compile happens with the app **up** (no port needed — keeps the UI alive through the slow
 part). Then: stop app → `kill_stray_apps()` (pkill the app by name) → `free_serial_ports()`
 (`fuser -k` the ttys) → `_probe_ports()` → `arduino-cli upload` to each identified port →
-record the flashed version → restart app. A fullscreen "please wait" splash shows during
-the upload. Only a **successful** upload records the version, so a failure/absence retries.
+record the flashed version → **reboot the Pi** (`_reboot_pi`). A live progress splash
+(`flash_splash.py`, driven by a progress file) shows each step and the final flashed
+versions. Only a **successful** upload records the version, so a failure/absence retries.
+
+**Why reboot after flashing:** the ESP32 auto-reset after `arduino-cli upload` is not
+dependable on this hardware (boards can sit in the bootloader, not answering `WHO AM I`),
+and the app deliberately never toggles DTR/RTS. A reboot is the known-good recovery. It is
+loop-safe because the new `FW_VERSION` is recorded to `flashed_firmware.json` (with
+`os.sync()`) BEFORE the reboot, so the post-reboot firmware check finds nothing to flash.
+The reboot only fires when `app is not None` (never in tests/headless) and needs
+passwordless `sudo` (the Pi default).
 
 - **Board identity** is by `WHO AM I` → `IAM:<id>` at flash time (independent of the
   saved `autocycler_config.json`).
@@ -80,6 +89,11 @@ the upload. Only a **successful** upload records the version, so a failure/absen
   discovery blacklists the onboard names (POSIX-only; no-op for Windows `COM` ports).
 - **Single instance only.** Duplicate launchers/apps both open a port and garble comms.
   `acquire_single_instance()` (flock) keeps one launcher; ports are opened `exclusive=True`.
+- **Always close serial ports on EVERY path (incl. exceptions).** With `exclusive=True`, a
+  port leaked open (e.g. an exception mid-probe) keeps its lock and blocks every future
+  open of that port until the process restarts — the "stuck until reboot" failure. Probe
+  helpers use `try/finally` to close, and `SerialDevice.__init__` closes + re-raises if
+  its post-open setup fails.
 - **Pis have no RTC** — log timestamps jump when NTP corrects the clock after boot; that's
   cosmetic, not a reboot loop. Check `uptime` to tell the difference.
 

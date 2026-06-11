@@ -115,6 +115,7 @@ chk "self-updating launcher deployed"  "grep -q 'def self_update' '${DIR}/launch
 chk "firmware sketches deployed"        "test -f '${DIR}/AUTOCYCLER_DISPENSOR/AUTOCYCLER_DISPENSOR.ino' && test -f '${DIR}/AUTOCYCLER_FRONT/AUTOCYCLER_FRONT.ino'"
 chk "ModemManager disabled"            "! (systemctl is-enabled ModemManager 2>/dev/null | grep -q enabled)"
 chk "serial access (dialout group)"    "getent group dialout | grep -qw '${USER}'"
+chk "passwordless sudo (auto-reboot)"  "sudo -n true 2>/dev/null"
 
 say "Done"
 if [ "${FAILED}" = 0 ]; then
