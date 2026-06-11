@@ -125,6 +125,43 @@ def test_unidentified_present_board_flashed_by_inference():
     print("PASS: unidentified-but-present board flashed by inference on the free port")
 
 
+class _SpyApp:
+    def __init__(self):
+        self.calls = []
+    def stop(self):
+        self.calls.append("stop")
+    def start(self):
+        self.calls.append("start")
+
+
+def test_self_update_noop_when_launcher_unchanged():
+    """No re-exec / app churn when launcher.py already matches the branch."""
+    saved_fetch, saved_md5 = launcher._fetch, launcher._md5_file
+    try:
+        launcher._fetch = lambda url: b"launcher source bytes"
+        launcher._md5_file = lambda p: launcher._md5_bytes(b"launcher source bytes")
+        app = _SpyApp()
+        launcher.self_update(app)
+        assert app.calls == [], "unchanged launcher must not stop the app or re-exec"
+    finally:
+        launcher._fetch, launcher._md5_file = saved_fetch, saved_md5
+    print("PASS: self_update is a no-op when launcher.py is unchanged")
+
+
+def test_self_update_rejects_unparseable_launcher():
+    """A syntactically broken launcher.py is rejected (no write, no re-exec) -> no brick."""
+    saved_fetch, saved_md5 = launcher._fetch, launcher._md5_file
+    try:
+        launcher._fetch = lambda url: b"def (:\n  this is not valid python\n"
+        launcher._md5_file = lambda p: "different-from-remote"
+        app = _SpyApp()
+        launcher.self_update(app)   # must return without app.stop()/execv
+        assert app.calls == [], "a non-parsing launcher must be rejected"
+    finally:
+        launcher._fetch, launcher._md5_file = saved_fetch, saved_md5
+    print("PASS: self_update rejects a launcher that won't compile (fleet-safe)")
+
+
 def test_flash_gated_on_fw_version_not_md5():
     """A comment/whitespace edit (same FW_VERSION) must NOT re-flash; a version bump must."""
     launcher._have_arduino_cli = lambda: True
@@ -189,6 +226,8 @@ if __name__ == "__main__":
         test_only_changed_board_reflashes,
         test_failed_flash_is_retried,
         test_unidentified_present_board_flashed_by_inference,
+        test_self_update_noop_when_launcher_unchanged,
+        test_self_update_rejects_unparseable_launcher,
         test_flash_gated_on_fw_version_not_md5,
         test_no_devices_present_defers_flash,
         test_missing_toolchain_does_not_record,

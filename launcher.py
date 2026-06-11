@@ -50,17 +50,21 @@ APP_DIR       = os.environ.get("AUTOCYCLER_DIR", "/home/pi/autocycler")
 LOCAL_SCRIPT  = os.path.join(APP_DIR, "coffee_cycler.py")
 FLASH_STATE   = os.path.join(APP_DIR, "flashed_firmware.json")
 LOG_PATH      = os.path.join(APP_DIR, "launcher.log")
-STATUS_FILE   = os.path.join(APP_DIR, "launcher_status.txt")   # human-readable state
-SPLASH_SCRIPT = os.path.join(APP_DIR, "flash_splash.py")       # "please wait" screen
-LOCK_FILE     = os.path.join(APP_DIR, "launcher.lock")         # single-instance guard
+STATUS_FILE     = os.path.join(APP_DIR, "launcher_status.txt")   # human-readable state
+SPLASH_SCRIPT   = os.path.join(APP_DIR, "flash_splash.py")       # "please wait" screen
+BOOTSCRIPT_PATH = os.path.join(APP_DIR, "bootscript.py")         # autostart shim
+LOCK_FILE       = os.path.join(APP_DIR, "launcher.lock")         # single-instance guard
 
 # ── Repo / URLs ─────────────────────────────────────────────────────────────────
 # Branch the Pi polls for app + firmware updates. Override per-Pi with the
 # AUTOCYCLER_BRANCH env var if you want a tester on a different branch.
 # raw.githubusercontent.com resolves branch names that contain "/".
-GITHUB_BRANCH = os.environ.get("AUTOCYCLER_BRANCH", "main")
-RAW_BASE      = f"https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/{GITHUB_BRANCH}"
-APP_URL       = f"{RAW_BASE}/coffee_cycler.py"
+GITHUB_BRANCH  = os.environ.get("AUTOCYCLER_BRANCH", "main")
+RAW_BASE       = f"https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/{GITHUB_BRANCH}"
+APP_URL        = f"{RAW_BASE}/coffee_cycler.py"
+LAUNCHER_URL   = f"{RAW_BASE}/launcher.py"        # the launcher self-updates from here
+SPLASH_URL     = f"{RAW_BASE}/flash_splash.py"
+BOOTSCRIPT_URL = f"{RAW_BASE}/bootscript.py"
 
 # Each ESP32 board: GitHub raw URL of its sketch, the local sketch directory, the local
 # .ino path, keyed by the WHO AM I identity the firmware reports.
@@ -588,9 +592,60 @@ class App:
         self.proc = None
 
 
+def self_update(app: App) -> None:
+    """Keep launcher.py (and its helper scripts) current. The launcher cannot update
+    itself the way it updates the app, so it does it here: if launcher.py on the branch
+    differs, syntax-check it, write it, stop the app, release the single-instance lock,
+    and re-exec so the new launcher runs. A bad push can't brick the fleet — a file that
+    won't even parse is rejected and the current launcher keeps running. Does NOT return
+    if it re-execs (the new process's kill_stray_apps() + app.start() take over)."""
+    remote = _fetch(LAUNCHER_URL)
+    if remote is None:
+        return
+    running = os.path.abspath(__file__)
+    if _md5_file(running) == _md5_bytes(remote):
+        return
+    try:
+        compile(remote, running, "exec")   # never adopt a launcher that won't parse
+    except SyntaxError as e:
+        log.error("New launcher.py failed the syntax check; keeping current: %s", e)
+        return
+    try:
+        _write_atomic(running, remote)
+    except Exception as e:
+        log.error("Could not write new launcher.py: %s", e)
+        return
+    # Refresh helper scripts too (best effort — they don't trigger a re-exec themselves).
+    for url, path in ((SPLASH_URL, SPLASH_SCRIPT), (BOOTSCRIPT_URL, BOOTSCRIPT_PATH)):
+        b = _fetch(url)
+        if b is not None:
+            try:
+                _write_atomic(path, b)
+            except Exception:
+                pass
+    log.info("launcher.py updated — re-executing self.")
+    app.stop()   # don't orphan the app across the exec
+    try:
+        if _lock_handle is not None:
+            fcntl.flock(_lock_handle, fcntl.LOCK_UN)
+            _lock_handle.close()
+    except Exception:
+        pass
+    try:
+        os.execv(sys.executable, [sys.executable, running] + sys.argv[1:])
+    except Exception as e:
+        # Extremely rare. The new code is already on disk, so a normal restart picks it
+        # up; for now re-acquire the lock and keep running the current code.
+        log.error("Re-exec failed (%s); continuing on current code.", e)
+        acquire_single_instance()
+        app.start()
+
+
 def _apply_updates(app: App):
-    """One update cycle. App update => download + immediate restart. Firmware change =>
-    compile (app up), then brief stop to upload, then restart."""
+    """One update cycle. Launcher self-update (may re-exec) => app update (download +
+    restart) => firmware (compile app-up, brief stop to upload, restart)."""
+    self_update(app)   # may re-exec and never return
+
     if check_app_update():
         log.info("New app version — restarting app.")
         app.stop()
