@@ -35,7 +35,7 @@
 // ── Firmware version ───────────────────────────────────────────────────────────
 // The launcher flashes the board ONLY when this string changes — so editing comments
 // or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
-#define FW_VERSION "2026-06-10.2"
+#define FW_VERSION "2026-06-10.3"
 
 // ── MUX config ─────────────────────────────────────────────────────────────────
 #define PCA9548A_ADDR 0x70
@@ -97,6 +97,12 @@ void setCapPin(bool active) {
 void handleWhoAmI() {
   Serial.print("IAM:");
   Serial.println(DEVICE_ID);
+}
+
+// GET VERSION → FW:<FW_VERSION>  — lets the host show which firmware is running.
+void handleGetVersion() {
+  Serial.print("FW:");
+  Serial.println(FW_VERSION);
 }
 
 void handleGetColor(const String &args) {
@@ -194,6 +200,7 @@ void dispatch(const String &raw) {
     args.trim();
 
     if (noun == "COLOR") handleGetColor(args);
+    else if (noun == "VERSION") handleGetVersion();
     else {
       Serial.print("UNKNOWN:");
       Serial.println(cmd);

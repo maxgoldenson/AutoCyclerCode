@@ -51,7 +51,8 @@ LOCAL_SCRIPT  = os.path.join(APP_DIR, "coffee_cycler.py")
 FLASH_STATE   = os.path.join(APP_DIR, "flashed_firmware.json")
 LOG_PATH      = os.path.join(APP_DIR, "launcher.log")
 STATUS_FILE     = os.path.join(APP_DIR, "launcher_status.txt")   # human-readable state
-SPLASH_SCRIPT   = os.path.join(APP_DIR, "flash_splash.py")       # "please wait" screen
+SPLASH_SCRIPT   = os.path.join(APP_DIR, "flash_splash.py")       # live progress screen
+FLASH_PROGRESS  = os.path.join(APP_DIR, "flash_progress.txt")    # text the splash renders
 BOOTSCRIPT_PATH = os.path.join(APP_DIR, "bootscript.py")         # autostart shim
 LOCK_FILE       = os.path.join(APP_DIR, "launcher.lock")         # single-instance guard
 
@@ -96,6 +97,7 @@ COMPILE_TIMEOUT_S = 600    # ESP32 compile on a Pi can be slow
 UPLOAD_TIMEOUT_S  = 240    # flashing a board
 FLASH_BACKOFF_S   = 300    # don't re-attempt a pending flash more often than this while
                            # the USB topology is unchanged (avoids disrupting the app)
+SUMMARY_HOLD_S    = 6      # how long the final "flashed versions" summary stays on screen
 
 # ── Logging (resilient: console always, file if the dir is writable) ─────────────
 _handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -434,12 +436,23 @@ def _write_status(msg: str):
         pass
 
 
-def _show_splash(msg: str):
-    """Best-effort fullscreen 'please wait' window during flashing. Returns Popen|None."""
+def _write_progress(text: str):
+    """Write the block of text the flash splash renders live (best effort)."""
+    try:
+        _write_atomic(FLASH_PROGRESS, text.encode())
+    except Exception:
+        pass
+
+
+def _show_splash(progress_file: str):
+    """Best-effort fullscreen LIVE progress window during flashing. It renders whatever
+    the launcher writes to `progress_file` (via _write_progress), refreshing 4x/sec.
+    Returns Popen|None."""
     if not os.path.exists(SPLASH_SCRIPT):
         return None
     try:
-        return subprocess.Popen([sys.executable, SPLASH_SCRIPT, msg], env=os.environ.copy())
+        return subprocess.Popen([sys.executable, SPLASH_SCRIPT, progress_file],
+                                env=os.environ.copy())
     except Exception as e:
         log.info("Splash unavailable: %s", e)
         return None
@@ -497,23 +510,47 @@ def flash_boards(changes: dict, app=None):
     _last_flash_ports = ports
     _last_flash_attempt = time.time()
 
+    # Live progress for the splash: one status phrase per board, re-rendered at each step.
+    boards = sorted(changes.keys())
+    phase = {b: "queued…" for b in boards}
+
+    def push(header="Updating firmware…", footer="Please do not power off."):
+        lines = [header, ""]
+        lines += [f"{b:<16}{phase[b]}" for b in boards]
+        if footer:
+            lines += ["", footer]
+        _write_progress("\n".join(lines))
+
+    splash = _show_splash(FLASH_PROGRESS) if app is not None else None
+    push()
+
     # Compile first — the slow part — while the app UI is still up (no port needed).
     compiled: dict = {}
-    for board, tag in changes.items():
+    for board in boards:
+        phase[board] = "compiling firmware…"; push()
         if _compile_board(board):
-            compiled[board] = tag
+            compiled[board] = changes[board]
+            phase[board] = "compiled — ready to flash"
+        else:
+            phase[board] = "compile FAILED — will retry"
+        push()
     if not compiled:
+        if splash is not None:
+            push("Firmware update could not start", "Returning to the app…")
+            time.sleep(SUMMARY_HOLD_S)
+            _hide_splash(splash)
         return
 
-    # Stop the app to free the ports, show a 'please wait' splash, then probe + upload.
-    splash = None
+    # Stop the app to free the ports, then probe + upload.
     if app is not None:
         app.stop()
         kill_stray_apps()    # kill any orphan coffee_cycler.py by name
         free_serial_ports()  # SIGKILL anything else still holding the ports (ModemManager, etc.)
         time.sleep(1)        # let the OS release the port fds / USB settle
-        splash = _show_splash("Updating firmware…\nPlease wait — this takes a minute.")
     try:
+        for board in compiled:
+            phase[board] = "detecting board…"
+        push()
         mapping = _probe_ports()
         # A board whose CURRENT firmware is halted/stale may not answer WHO AM I, yet it
         # is still flashable by port. If exactly one changed board is unidentified and
@@ -530,20 +567,32 @@ def flash_boards(changes: dict, app=None):
                         "port %s (its firmware may be halted).",
                         unidentified[0], free_usb[0])
         state = _load_flash_state()
-        for board, tag in compiled.items():
+        for board in boards:
+            tag = compiled.get(board)
+            if tag is None:
+                continue   # compile already failed; phase already says so
             port = mapping.get(board)
             if not port:
+                phase[board] = "waiting — board not connected"; push()
                 msg = "Waiting for %s to be connected before flashing its firmware." % board
                 log.info(msg)
                 _write_status(msg)
                 continue
+            phase[board] = "flashing… (do not power off)"; push()
             if _upload_board(board, port):
                 state[board] = tag
                 _save_flash_state(state)
+                phase[board] = f"updated  ✓  v{tag}"; push()
                 log.info("Flashed %s successfully (recorded version %s).", board, tag)
                 _write_status("Flashed %s successfully (version %s)." % (board, tag))
             else:
+                phase[board] = "flash FAILED — will retry"; push()
                 log.error("Upload failed for %s; will retry next cycle.", board)
+        if splash is not None:
+            # Hold the final result (the flashed versions) on screen so the operator can
+            # read what was installed before the app comes back.
+            push("Firmware update complete", "Returning to the app…")
+            time.sleep(SUMMARY_HOLD_S)
     finally:
         _hide_splash(splash)
         if app is not None:

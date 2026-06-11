@@ -14,7 +14,7 @@
 // ── Firmware version ───────────────────────────────────────────────────────────
 // The launcher flashes the board ONLY when this string changes — so editing comments
 // or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
-#define FW_VERSION  "2026-06-10.3"
+#define FW_VERSION  "2026-06-10.4"
 
 // ── Stepper config ─────────────────────────────────────────────────────────────
 #define STEPS_PER_REV     (400 * 48 / 20)   // 1.8° motor + gearing
@@ -190,6 +190,15 @@ void handleGetStatus() {
 }
 
 /**
+ * GET VERSION → FW:<FW_VERSION>
+ * Lets the host display which firmware is actually running on the board.
+ */
+void handleGetVersion() {
+    Serial.print("FW:");
+    Serial.println(FW_VERSION);
+}
+
+/**
  * SET MOTOR <ON|OFF>
  * Holds or releases the motor driver enable line independently of moves.
  * Useful for holding position under load or releasing for manual adjustment.
@@ -230,7 +239,8 @@ void dispatch(const String &raw) {
     } else if (verb == "GET") {
         String noun = rest;
         noun.toUpperCase();
-        if (noun == "STATUS") handleGetStatus();
+        if      (noun == "STATUS")  handleGetStatus();
+        else if (noun == "VERSION") handleGetVersion();
         else { Serial.print("UNKNOWN:"); Serial.println(cmd); }
 
     } else if (verb == "SET") {

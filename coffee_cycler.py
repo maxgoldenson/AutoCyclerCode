@@ -49,7 +49,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-10 23:36"
+VERSION = "2026-06-11 16:04"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -772,6 +772,11 @@ class CoffeeCyclerApp:
                  font=("Helvetica", 26, "bold"), anchor="w").pack(side="left")
         tk.Label(hdr, text=f"v{VERSION}", bg=self.BG, fg=self.SUCCESS,
                  font=("Helvetica", 14, "bold")).pack(side="left", padx=(16, 0))
+        # ESP32 firmware versions (queried after discovery) so it's obvious at a glance
+        # whether the app AND both boards are up to date.
+        self.fw_var = tk.StringVar(value="ESP32 fw: —")
+        tk.Label(hdr, textvariable=self.fw_var, bg=self.BG, fg=self.MUTED,
+                 font=("Helvetica", 12), anchor="w").pack(side="left", padx=(16, 0))
         self.conn_var   = tk.StringVar(value="Scanning for devices...")
         self.conn_label = tk.Label(hdr, textvariable=self.conn_var,
                                    bg=self.BG, fg=self.MUTED,
@@ -1177,11 +1182,27 @@ class CoffeeCyclerApp:
                 print(f"[boot] SET SERVO {SERVO_REST} -> {resp!r}")
                 resp_cap = self.devices.front.send("SET CAP OFF", expect="CAP:")
                 print(f"[boot] SET CAP OFF -> {resp_cap!r}")
+                # Report the firmware each board is running so the operator can confirm
+                # at a glance that the whole stack (app + both ESP32s) is up to date.
+                disp_fw  = self._query_fw(self.devices.dispenser)
+                front_fw = self._query_fw(self.devices.front)
+                fw_text = f"ESP32 fw — DISP {disp_fw}  ·  FRONT {front_fw}"
+                self.root.after(0, lambda t=fw_text: self.fw_var.set(t))
         except Exception as e:
             # Never let a discovery error wedge the auto-reconnect (it would leave
             # _discovering stuck True). Report it and let the next scan retry.
             ok, msg = False, f"Discovery error: {e}"
         self.root.after(0, lambda: self._on_discovery_done(ok, msg))
+
+    @staticmethod
+    def _query_fw(device) -> str:
+        """Ask a board its firmware version (GET VERSION -> FW:<ver>). Returns the version
+        string, or '?' if the board doesn't answer (e.g. older firmware without the query)."""
+        try:
+            resp = device.send("GET VERSION", expect="FW:")
+        except Exception:
+            resp = ""
+        return resp[3:].strip() if resp.startswith("FW:") else "?"
 
     def _on_discovery_done(self, ok: bool, msg: str):
         self._discovering = False
@@ -1191,6 +1212,7 @@ class CoffeeCyclerApp:
             self._set_status("Devices connected. Ready to start.", self.MUTED)
             self.start_btn.configure(state="normal")
         else:
+            self.fw_var.set("ESP32 fw: —")
             self._set_conn(f"Connection failed: {msg}", self.DANGER)
             self._set_status("Waiting for devices -- plug in the USB module(s); "
                              "retrying automatically.", self.WARNING)
