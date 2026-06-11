@@ -28,7 +28,11 @@ bootId changed or `READY:` seen mid-wait → board reset, dose unknown, NEVER re
 Firmware waits `ACK_SETTLE_MS` (75 ms) after the move before transmitting the ack so it
 isn't sent inside the motor's switching transients. The FRONT firmware has a CAP
 auto-release watchdog (`CAP_MAX_ON_MS`, 15 s) so the brew trigger can never stay asserted
-if the host dies. `CycleRunner.run_one()` always returns servo→REST and CAP→OFF on any exit.
+if the host dies. `CycleRunner.run_one()` always returns servo→REST (gate closed) and
+CAP→OFF on any cycle exit (safe state between cycles). **Idle/done resting state is gate
+OPEN** (`SERVO_OPEN`): the app opens the gate on connect (`_discovery_worker`) and on a
+clean run end / user stop (`_on_finished` → `_set_idle_gate`). NOT opened on `_on_error`
+(the board may be in an unknown state).
 
 **Cycle sequence:**
 1. GET COLOR — abort if not white (min channel >= 160, spread <= 60)

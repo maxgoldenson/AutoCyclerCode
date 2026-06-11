@@ -49,7 +49,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-11 17:02"
+VERSION = "2026-06-11 18:19"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1203,8 +1203,9 @@ class CoffeeCyclerApp:
                 status_cb=lambda s: self.root.after(0, lambda m=s: self._set_conn(m, self.MUTED))
             )
             if ok:
-                resp = self.devices.front.send(f"SET SERVO {SERVO_REST}")
-                print(f"[boot] SET SERVO {SERVO_REST} -> {resp!r}")
+                # Idle resting state: gate OPEN, brew trigger released.
+                resp = self.devices.front.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
+                print(f"[boot] SET SERVO {SERVO_OPEN} (gate open, idle) -> {resp!r}")
                 resp_cap = self.devices.front.send("SET CAP OFF", expect="CAP:")
                 print(f"[boot] SET CAP OFF -> {resp_cap!r}")
                 # Report the firmware each board is running so the operator can confirm
@@ -1610,6 +1611,7 @@ class CoffeeCyclerApp:
 
     def _on_finished(self, stopped: bool):
         self._reset_controls()
+        self._set_idle_gate()    # done/idle resting state -> gate OPEN (not on error)
         if stopped:
             self._set_status("Stopped by user.", self.WARNING)
         else:
@@ -1622,13 +1624,26 @@ class CoffeeCyclerApp:
         self._set_status(f"Error: {msg}", self.DANGER)
 
     def _reset_controls(self):
-        self._clear_busy()   # run finished -> let the OTA launcher resume updates
+        self._clear_busy()       # run finished -> let the OTA launcher resume updates
         for w in (self.cycles_entry, self.ring_min_entry,
                   self.ring_timeout_entry, self.maint_entry):
             w.configure(state="normal")
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.reconnect_btn.configure(state="normal")
+
+    def _set_idle_gate(self):
+        """Park the gate OPEN — its resting position whenever the machine is idle or done.
+        Runs in a daemon thread so an unresponsive board can't freeze the UI."""
+        f = self.devices.front
+        if f is None:
+            return
+        def _open():
+            try:
+                f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
+            except Exception as e:
+                print(f"[idle] open gate failed: {e}")
+        threading.Thread(target=_open, daemon=True).start()
 
     # -- "cycles running" heartbeat (read by the OTA launcher) ----------------
     def _write_busy(self):
