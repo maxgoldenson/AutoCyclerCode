@@ -341,6 +341,31 @@ def _upload_board(board: str, port: str) -> bool:
         return False
 
 
+def _reset_board_run_mode(port: str):
+    """Hard-reset an ESP32 into RUN mode after flashing (esptool's classic reset: DTR
+    de-asserted = GPIO0 high = run, then pulse RTS = EN/reset). Without this the board
+    can sit in the download bootloader after a flash — not running the new firmware and
+    not answering WHO AM I — until a power cycle/reboot. The app deliberately never
+    toggles DTR/RTS, so the launcher must do it here."""
+    try:
+        import serial
+    except Exception:
+        return
+    try:
+        s = serial.Serial(port)
+        try:
+            s.dtr = False    # GPIO0 high -> run mode (NOT the download bootloader)
+            s.rts = True     # EN low     -> hold in reset
+            time.sleep(0.1)
+            s.rts = False    # EN high    -> release -> boots the new firmware
+            time.sleep(0.3)
+        finally:
+            s.close()
+        log.info("Reset %s into run mode after flashing.", port)
+    except Exception as e:
+        log.info("Post-flash reset of %s skipped: %s", port, e)
+
+
 class _ProbeTimeout(Exception):
     pass
 
@@ -580,6 +605,8 @@ def flash_boards(changes: dict, app=None):
                 continue
             phase[board] = "flashing… (do not power off)"; push()
             if _upload_board(board, port):
+                phase[board] = "starting new firmware…"; push()
+                _reset_board_run_mode(port)   # boot it now, not after a reboot
                 state[board] = tag
                 _save_flash_state(state)
                 phase[board] = f"updated  ✓  v{tag}"; push()
