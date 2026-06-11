@@ -42,6 +42,11 @@ you never have to touch the Pi again:
 | **Launcher** itself | `launcher.py` changed → self-updates and relaunches |
 | **ESP32 firmware** | a board's `FW_VERSION` changed → compiles + flashes it (live progress screen), then **reboots the Pi** to bring the board up on the new firmware (the version is recorded first, so it won't loop) |
 
+**Updates never interrupt a running brew series.** While the app is running cycles it
+raises a "busy" flag; the launcher defers *all* updates (app, firmware, and the reboot)
+until the series finishes, then applies them. If the app crashes mid-run the flag goes
+stale and updates resume on their own.
+
 ---
 
 ## 3. Releasing an update (maintainer)

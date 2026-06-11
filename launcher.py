@@ -50,6 +50,8 @@ APP_DIR       = os.environ.get("AUTOCYCLER_DIR", "/home/pi/autocycler")
 LOCAL_SCRIPT  = os.path.join(APP_DIR, "coffee_cycler.py")
 FLASH_STATE   = os.path.join(APP_DIR, "flashed_firmware.json")
 LOG_PATH      = os.path.join(APP_DIR, "launcher.log")
+BUSY_FILE     = os.path.join(APP_DIR, "app_busy")   # app keeps this fresh while cycling
+BUSY_STALE_S  = 30.0   # ignore the busy marker if not refreshed in this long (app crashed)
 STATUS_FILE     = os.path.join(APP_DIR, "launcher_status.txt")   # human-readable state
 SPLASH_SCRIPT   = os.path.join(APP_DIR, "flash_splash.py")       # live progress screen
 FLASH_PROGRESS  = os.path.join(APP_DIR, "flash_progress.txt")    # text the splash renders
@@ -721,9 +723,33 @@ def self_update(app: App) -> None:
         app.start()
 
 
+def _app_busy() -> bool:
+    """True while the app is running a cycle series (it refreshes BUSY_FILE). Stale
+    markers (app crashed) are ignored so updates resume on their own."""
+    try:
+        return (time.time() - os.path.getmtime(BUSY_FILE)) < BUSY_STALE_S
+    except OSError:
+        return False
+
+
+_deferred_logged = False
+
+
 def _apply_updates(app: App):
     """One update cycle. Launcher self-update (may re-exec) => app update (download +
-    restart) => firmware (compile app-up, brief stop to upload, restart)."""
+    restart) => firmware (compile app-up, brief stop to upload, reboot).
+
+    NOTHING here runs while a cycle series is active — a self-update re-exec, an app
+    restart, a firmware flash, and the post-flash reboot would all interrupt the run.
+    We skip the whole cycle and retry next time; once the series finishes, updates apply."""
+    global _deferred_logged
+    if _app_busy():
+        if not _deferred_logged:
+            log.info("Cycle series running — deferring all updates/flashing until idle.")
+            _deferred_logged = True
+        return
+    _deferred_logged = False
+
     self_update(app)   # may re-exec and never return
 
     if check_app_update():

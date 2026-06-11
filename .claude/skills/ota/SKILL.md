@@ -12,7 +12,12 @@ and flashes the ESP32s itself with `arduino-cli`.
 
 ## The three things that auto-update (in `launcher.py`, every ~60 s)
 
-`_apply_updates()` runs in this order each cycle:
+`_apply_updates()` runs in this order each cycle — but **first checks `_app_busy()` and
+skips the entire cycle while a brew series is running**, so an update/flash/reboot never
+interrupts cycles. The app keeps `BUSY_FILE` (`app_busy`) fresh via a heartbeat in `_tick`
+while `cycle_thread` is alive and removes it when idle; the launcher treats it as busy
+only if refreshed within `BUSY_STALE_S` (30 s), so a crashed app's stale flag is ignored
+and updates resume on their own. Then, in order:
 
 1. **Launcher self-update** (`self_update`) — pulls `launcher.py`; if its md5 differs,
    **syntax-checks it** (`compile()` — a non-parsing push is rejected so a bad commit

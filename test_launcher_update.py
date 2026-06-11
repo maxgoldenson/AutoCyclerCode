@@ -13,6 +13,7 @@ Run:  python3 test_launcher_update.py
 """
 import os
 import sys
+import time
 import tempfile
 
 # Redirect the install dir BEFORE importing the launcher (APP_DIR is read at import).
@@ -138,6 +139,41 @@ class _SpyApp:
         self.calls.append("start")
 
 
+def test_updates_deferred_while_cycle_series_running():
+    """A fresh busy marker must make _apply_updates do nothing — no self-update, no app
+    restart, no firmware flash, no reboot — so a brew series is never interrupted."""
+    with open(launcher.BUSY_FILE, "w") as f:
+        f.write(str(int(time.time())))
+    saved = launcher.check_app_update
+    calls = {"n": 0}
+    launcher.check_app_update = lambda: (calls.__setitem__("n", calls["n"] + 1) or False)
+    app = _SpyApp()
+    try:
+        launcher._apply_updates(app)
+        assert calls["n"] == 0, "must not even check for updates while a series runs"
+        assert app.calls == [], app.calls
+    finally:
+        launcher.check_app_update = saved
+        launcher._deferred_logged = False
+        try: os.remove(launcher.BUSY_FILE)
+        except OSError: pass
+    print("PASS: updates deferred while a cycle series is running")
+
+
+def test_stale_busy_marker_ignored():
+    """If the app crashed mid-run, the busy marker goes stale and updates resume."""
+    with open(launcher.BUSY_FILE, "w") as f:
+        f.write("old")
+    old = time.time() - (launcher.BUSY_STALE_S + 10)
+    os.utime(launcher.BUSY_FILE, (old, old))
+    try:
+        assert launcher._app_busy() is False, "a stale busy marker must be ignored"
+    finally:
+        try: os.remove(launcher.BUSY_FILE)
+        except OSError: pass
+    print("PASS: stale busy marker is ignored (updates resume)")
+
+
 def test_self_update_noop_when_launcher_unchanged():
     """No re-exec / app churn when launcher.py already matches the branch."""
     saved_fetch, saved_md5 = launcher._fetch, launcher._md5_file
@@ -232,6 +268,8 @@ if __name__ == "__main__":
         test_unidentified_present_board_flashed_by_inference,
         test_self_update_noop_when_launcher_unchanged,
         test_self_update_rejects_unparseable_launcher,
+        test_updates_deferred_while_cycle_series_running,
+        test_stale_busy_marker_ignored,
         test_flash_gated_on_fw_version_not_md5,
         test_no_devices_present_defers_flash,
         test_missing_toolchain_does_not_record,

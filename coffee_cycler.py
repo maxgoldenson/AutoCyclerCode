@@ -49,11 +49,16 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-11 16:52"
+VERSION = "2026-06-11 17:02"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_DIR, "autocycler_config.json")
+# Heartbeat file the app keeps fresh WHILE a cycle series is running. The OTA launcher
+# checks it and defers all updates (app, firmware, reboot) until the run finishes, so a
+# brew series is never interrupted by a self-update / flash / reboot.
+BUSY_FILE        = os.path.join(_DIR, "app_busy")
+BUSY_HEARTBEAT_S = 3.0   # how often to refresh BUSY_FILE while a run is active
 
 # -- Serial config -------------------------------------------------------------
 BAUD_RATE         = 115200
@@ -687,6 +692,8 @@ class CoffeeCyclerApp:
         self.current_cycle    = 0
         self.cycle_thread: Optional[threading.Thread] = None
         self._starting        = False   # guards against re-entrant / double Start
+        self._last_busy_touch = 0.0     # throttle for the BUSY_FILE heartbeat
+        self._clear_busy()              # no run yet -> clear any stale marker from a crash
         self.stop_flag        = threading.Event()
         self._maintenance_resume = threading.Event()
         self._maintenance_resume.set()
@@ -1291,6 +1298,9 @@ class CoffeeCyclerApp:
             self.start_time    = time.time()
             self.current_cycle = 0
             self._maintenance_resume.set()
+            self._last_busy_touch = time.time()
+            self._write_busy()   # mark busy NOW (before the first heartbeat) so an OTA
+                                 # check can't slip in between start and the first tick
             self.cycle_thread = threading.Thread(
                 target=self._run_cycles,
                 args=(n, ring_wait_min, ring_timeout, maint_interval),
@@ -1612,12 +1622,27 @@ class CoffeeCyclerApp:
         self._set_status(f"Error: {msg}", self.DANGER)
 
     def _reset_controls(self):
+        self._clear_busy()   # run finished -> let the OTA launcher resume updates
         for w in (self.cycles_entry, self.ring_min_entry,
                   self.ring_timeout_entry, self.maint_entry):
             w.configure(state="normal")
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.reconnect_btn.configure(state="normal")
+
+    # -- "cycles running" heartbeat (read by the OTA launcher) ----------------
+    def _write_busy(self):
+        try:
+            with open(BUSY_FILE, "w") as f:
+                f.write(str(int(time.time())))
+        except OSError:
+            pass
+
+    def _clear_busy(self):
+        try:
+            os.remove(BUSY_FILE)
+        except OSError:
+            pass
 
     def _update_ui(self, cycle: Optional[str] = None, step: Optional[tuple] = None):
         def apply():
@@ -1639,6 +1664,14 @@ class CoffeeCyclerApp:
         # once the USB module(s) are plugged in — no manual Reconnect needed. Works with
         # one, both, or no devices present; it just keeps retrying until both are found.
         cycle_running = self.cycle_thread is not None and self.cycle_thread.is_alive()
+
+        # Keep the "cycles running" marker fresh so the OTA launcher won't update/flash/
+        # reboot mid-series. We refresh it (rather than write once) so that if the app
+        # crashes the marker goes stale and the launcher resumes on its own.
+        if cycle_running and time.time() - self._last_busy_touch > BUSY_HEARTBEAT_S:
+            self._last_busy_touch = time.time()
+            self._write_busy()
+
         if (not self.devices.ready and not self._discovering and not self._starting
                 and not cycle_running
                 and time.time() - self._last_auto_discovery > AUTO_RECONNECT_S):
