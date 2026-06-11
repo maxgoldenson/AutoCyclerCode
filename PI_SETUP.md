@@ -1,14 +1,18 @@
-# Pi deployment guide — auto-update + ESP32 firmware flashing
+# Pi deployment guide — detailed reference
+
+> **New here? Start with [README.md](README.md)** — it has the one-command setup and the
+> day-to-day usage. This file is the detailed / manual reference and troubleshooting deep-dive.
 
 ## Quick install (recommended)
 
 One script does everything below — toolchain, libraries, code, autostart. Run it on the
-Pi as the `pi` user:
+Pi as your normal user:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/main/pi_install.sh | bash
 sudo reboot
 ```
+
 
 It is safe to re-run. Override defaults with env vars, e.g.
 `AUTOCYCLER_BRANCH=main ESP32_FQBN=esp32:esp32:esp32doit-devkit-v1 bash pi_install.sh`.
