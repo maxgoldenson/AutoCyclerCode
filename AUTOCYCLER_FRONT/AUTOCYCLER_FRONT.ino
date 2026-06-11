@@ -32,6 +32,11 @@
 // ── Device identity ────────────────────────────────────────────────────────────
 #define DEVICE_ID "FRONT_ASSEMBLY"
 
+// ── Firmware version ───────────────────────────────────────────────────────────
+// The launcher flashes the board ONLY when this string changes — so editing comments
+// or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
+#define FW_VERSION "2026-06-10.2"
+
 // ── MUX config ─────────────────────────────────────────────────────────────────
 #define PCA9548A_ADDR 0x70
 #define MUX_CH_RING 0   // Channel 0 = Ring sensor

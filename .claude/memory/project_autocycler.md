@@ -40,4 +40,11 @@ if the host dies. `CycleRunner.run_one()` always returns servo→REST and CAP→
 
 **Config persistence:** `autocycler_config.json` in project root saves discovered COM port assignments.
 
+**OTA / fleet (launcher.py):** The Pi polls `main` and auto-updates `coffee_cycler.py`
+(gated on file md5) and the ESP32 firmware. Firmware flashing is gated on each sketch's
+`#define FW_VERSION "..."`, NOT its md5 — so editing comments/whitespace never re-flashes
+the fleet; only a FW_VERSION bump does (bump it on any functional firmware change). The
+last-flashed version per board is recorded in `flashed_firmware.json`; a failed/absent
+flash is retried, a success is recorded once and not repeated.
+
 **Why:** Auto-discovery probes all COM ports with WHO AM I so user doesn't need to manually set port numbers.

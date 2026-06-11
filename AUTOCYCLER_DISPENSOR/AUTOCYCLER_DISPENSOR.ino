@@ -11,6 +11,11 @@
 // ── Device identity ────────────────────────────────────────────────────────────
 #define DEVICE_ID   "DISPENSER"
 
+// ── Firmware version ───────────────────────────────────────────────────────────
+// The launcher flashes the board ONLY when this string changes — so editing comments
+// or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
+#define FW_VERSION  "2026-06-10.3"
+
 // ── Stepper config ─────────────────────────────────────────────────────────────
 #define STEPS_PER_REV     (400 * 48 / 20)   // 1.8° motor + gearing
 #define MICROSTEPPING     4

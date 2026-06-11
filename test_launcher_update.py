@@ -125,6 +125,35 @@ def test_unidentified_present_board_flashed_by_inference():
     print("PASS: unidentified-but-present board flashed by inference on the free port")
 
 
+def test_flash_gated_on_fw_version_not_md5():
+    """A comment/whitespace edit (same FW_VERSION) must NOT re-flash; a version bump must."""
+    launcher._have_arduino_cli = lambda: True
+    launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+    launcher._compile_board = lambda b: True
+    launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0",
+                                     "FRONT_ASSEMBLY": "/dev/ttyUSB1"}
+    launcher._upload_board = lambda b, port: True
+
+    url = launcher.FIRMWARE["DISPENSER"]["url"]
+    _REMOTE[url] = b'#define FW_VERSION "9.0"\n// build A\n'
+    _reset_flash_throttle()
+    assert "DISPENSER" in launcher.fetch_firmware_changes(), "new version should flash"
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())   # records version 9.0
+    assert launcher.fetch_firmware_changes() == {}, "should be up to date after flashing"
+
+    # Comment-only change, SAME version -> source refreshes but NO re-flash.
+    _REMOTE[url] = b'#define FW_VERSION "9.0"\n// build B (only a comment changed)\n'
+    assert "DISPENSER" not in launcher.fetch_firmware_changes(), \
+        "a comment edit must NOT trigger a re-flash"
+
+    # Deliberate version bump -> flash.
+    _REMOTE[url] = b'#define FW_VERSION "9.1"\n// build B\n'
+    assert "DISPENSER" in launcher.fetch_firmware_changes(), \
+        "a FW_VERSION bump must trigger a flash"
+    print("PASS: flash gated on FW_VERSION (comment edits ignored, version bump flashes)")
+
+
 def test_no_devices_present_defers_flash():
     _REMOTE[launcher.FIRMWARE["DISPENSER"]["url"]] = b"DISPENSER FW V9"
     launcher._have_arduino_cli = lambda: True
@@ -160,6 +189,7 @@ if __name__ == "__main__":
         test_only_changed_board_reflashes,
         test_failed_flash_is_retried,
         test_unidentified_present_board_flashed_by_inference,
+        test_flash_gated_on_fw_version_not_md5,
         test_no_devices_present_defers_flash,
         test_missing_toolchain_does_not_record,
     ]

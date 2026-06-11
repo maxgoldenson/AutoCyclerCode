@@ -31,6 +31,7 @@ bootscript.py is a thin shim that just execs this file.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import json
 import time
@@ -245,11 +246,23 @@ def check_app_update() -> bool:
     return True
 
 
+_FW_VERSION_RE = re.compile(rb'#define\s+FW_VERSION\s+"([^"]*)"')
+
+
+def _firmware_version(content: bytes) -> Optional[str]:
+    """Extract the FW_VERSION string from a sketch, or None if it has none."""
+    m = _FW_VERSION_RE.search(content)
+    return m.group(1).decode("utf-8", "replace") if m else None
+
+
 def fetch_firmware_changes() -> dict:
-    """Return {board: remote_md5} for boards whose firmware differs from what was last
-    successfully flashed. Refreshes the local .ino on disk (so arduino-cli compiles the
-    new source), but the flash decision is gated on the flashed record, not the file, so
-    a failed flash is retried rather than lost."""
+    """Return {board: fw_tag} for boards whose firmware needs flashing.
+
+    The flash is gated on the sketch's FW_VERSION, NOT its md5 — so editing a comment or
+    whitespace does not force a fleet-wide re-flash; only a deliberate FW_VERSION bump
+    does. (A sketch with no FW_VERSION falls back to md5, preserving old behaviour.) The
+    local .ino is still refreshed on any byte change so arduino-cli compiles the latest
+    source; only the FLASH decision is version-gated."""
     state = _load_flash_state()
     changes: dict = {}
     for board, info in FIRMWARE.items():
@@ -259,9 +272,14 @@ def fetch_firmware_changes() -> dict:
         md5 = _md5_bytes(remote)
         if _md5_file(info["ino"]) != md5:
             _write_atomic(info["ino"], remote)
-            log.info("Downloaded new firmware source for %s (%s).", board, md5[:8])
-        if state.get(board) != md5:
-            changes[board] = md5
+            log.info("Downloaded firmware source for %s (md5 %s).", board, md5[:8])
+        ver = _firmware_version(remote)
+        tag = ver if ver is not None else ("md5:" + md5)   # gate value
+        recorded = state.get(board)
+        if recorded != tag:
+            log.info("%s firmware needs flashing: version %r (on board: %r).",
+                     board, tag, recorded)
+            changes[board] = tag
     return changes
 
 
@@ -477,9 +495,9 @@ def flash_boards(changes: dict, app=None):
 
     # Compile first — the slow part — while the app UI is still up (no port needed).
     compiled: dict = {}
-    for board, md5 in changes.items():
+    for board, tag in changes.items():
         if _compile_board(board):
-            compiled[board] = md5
+            compiled[board] = tag
     if not compiled:
         return
 
@@ -508,7 +526,7 @@ def flash_boards(changes: dict, app=None):
                         "port %s (its firmware may be halted).",
                         unidentified[0], free_usb[0])
         state = _load_flash_state()
-        for board, md5 in compiled.items():
+        for board, tag in compiled.items():
             port = mapping.get(board)
             if not port:
                 msg = "Waiting for %s to be connected before flashing its firmware." % board
@@ -516,10 +534,10 @@ def flash_boards(changes: dict, app=None):
                 _write_status(msg)
                 continue
             if _upload_board(board, port):
-                state[board] = md5
+                state[board] = tag
                 _save_flash_state(state)
-                log.info("Flashed %s successfully (recorded %s).", board, md5[:8])
-                _write_status("Flashed %s successfully." % board)
+                log.info("Flashed %s successfully (recorded version %s).", board, tag)
+                _write_status("Flashed %s successfully (version %s)." % (board, tag))
             else:
                 log.error("Upload failed for %s; will retry next cycle.", board)
     finally:
