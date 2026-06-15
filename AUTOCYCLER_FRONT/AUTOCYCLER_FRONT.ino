@@ -9,8 +9,9 @@
  *  GET COLOR RING  LED    → RGB:...  (keeps LED on after read)
  *
  *  SET SERVO <0-180>      → SERVO:<angle>
- *  SET CAP ON             → CAP:ON
- *  SET CAP OFF            → CAP:OFF
+ *  SET CAP ON             → CAP:ON     (drive trigger low continuously — held press)
+ *  SET CAP OFF            → CAP:OFF    (release: high-impedance)
+ *  SET CAP PULSE          → CAP:PULSE  (momentary tap: 10x drive-low 100ms / hi-Z 100ms)
  *
  *  On boot:               READY:FRONT_ASSEMBLY
  *  On error:              ERROR:<message>
@@ -35,7 +36,7 @@
 // ── Firmware version ───────────────────────────────────────────────────────────
 // The launcher flashes the board ONLY when this string changes — so editing comments
 // or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
-#define FW_VERSION "2026-06-10.3"
+#define FW_VERSION "2026-06-15.1"
 
 // ── MUX config ─────────────────────────────────────────────────────────────────
 #define PCA9548A_ADDR 0x70
@@ -57,6 +58,16 @@ Servo myServo;
 // host's 10s reset hold — so a real operation is never cut short.
 #define CAP_MAX_ON_MS 15000UL
 #define SERVO_REST_DEG 95   // safe "gate closed" position to assume on boot
+
+// ── Brew-trigger pulse config ────────────────────────────────────────────────────
+// A single static "drive low" sometimes fails to register on the machine's capacitive
+// start button. Signalling a capacitive electrode is really about briefly conducting a
+// small current to it, so instead of holding low we "tap" the button: a low-frequency
+// train that alternates actively driving the pin LOW (conducting) with high-impedance
+// (released). SET CAP PULSE runs CAP_PULSE_COUNT taps and always ends high-impedance.
+#define CAP_PULSE_COUNT  10    // number of low/hi-Z toggles per trigger
+#define CAP_PULSE_LOW_MS 100   // time actively driven LOW each tap
+#define CAP_PULSE_HIZ_MS 100   // time high-impedance (released) each tap
 
 // ── State ──────────────────────────────────────────────────────────────────────
 bool capActive = false;
@@ -90,6 +101,21 @@ void setCapPin(bool active) {
   } else {
     pinMode(CAP_PIN, INPUT);
   }
+}
+
+// Momentary capacitive-button "tap": toggle drive-low / high-impedance CAP_PULSE_COUNT
+// times to register a press more reliably than a single static assertion. Blocking
+// (~CAP_PULSE_COUNT * (LOW+HIZ) ms ≈ 2 s) and self-terminating — it ALWAYS ends
+// high-impedance (released), so the failsafe auto-release never needs to fire for it.
+void pulseCapTrigger() {
+  for (int i = 0; i < CAP_PULSE_COUNT; i++) {
+    pinMode(CAP_PIN, OUTPUT);
+    digitalWrite(CAP_PIN, LOW);   // actively conduct a small current into the electrode
+    delay(CAP_PULSE_LOW_MS);
+    pinMode(CAP_PIN, INPUT);      // high impedance — release
+    delay(CAP_PULSE_HIZ_MS);
+  }
+  capActive = false;              // ended released; keep the failsafe watchdog idle
 }
 
 // ── Command handlers ───────────────────────────────────────────────────────────
@@ -165,8 +191,11 @@ void handleSetCap(const String &args) {
   } else if (args.equalsIgnoreCase("OFF")) {
     setCapPin(false);
     Serial.println("CAP:OFF");
+  } else if (args.equalsIgnoreCase("PULSE")) {
+    pulseCapTrigger();
+    Serial.println("CAP:PULSE");
   } else {
-    Serial.println("ERROR:SET CAP requires ON or OFF");
+    Serial.println("ERROR:SET CAP requires ON, OFF, or PULSE");
   }
 }
 

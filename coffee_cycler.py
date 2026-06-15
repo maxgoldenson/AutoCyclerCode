@@ -9,7 +9,7 @@ Cycle sequence per brew:
   1. GET COLOR ERROR  -- abort if error light is red/orange/yellow
   2. SET ANGLE 360    -- dispense ~19 g
   3. Servo OPEN -> 1 s -> CLOSE
-  4. SET CAP ON -> brief pulse -> SET CAP OFF  -- trigger machine brew cycle
+  4. SET CAP PULSE    -- tap the brew button (10x low/hi-Z toggle) to start a brew
   5. Wait RING_WAIT_MIN_S, then poll Ring sensor for green completion flash
      * Green flash   -> proceed to next cycle
      * Warning color -> pause and prompt user (resume / reset / stop)
@@ -49,7 +49,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-11 18:19"
+VERSION = "2026-06-15 16:55"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -118,7 +118,6 @@ RING_WARN_YELLOW_RG_DIFF  = 60
 # -- Brew cycle timing defaults -----------------------------------------------
 DEFAULT_RING_WAIT_MIN_S = 45
 DEFAULT_RING_TIMEOUT_S  = 120
-CAP_PULSE_S             = 0.5
 
 # -- Pre-start checklist -------------------------------------------------------
 PRESTART_CHECKS = [
@@ -637,15 +636,15 @@ class CycleRunner:
         if not _sleep(1.0, stop_flag): return False, "Stopped"
         if not self._wait_for_blue(stop_flag, status_cb): return False, "Stopped"
 
-        resp_cap = f.send("SET CAP ON", expect="CAP:")
+        # Tap the brew button: the firmware toggles the trigger low/hi-Z 10x (~2 s) and
+        # ends released. Sent at-most-once (retries=0): a tap is NON-IDEMPOTENT, so a
+        # lost ack must NOT re-press (which could start a second brew). A missed trigger
+        # is self-correcting — the ring-sensor wait below just won't see a completion.
         trigger_time = time.time()
-        print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
-        if not _sleep(CAP_PULSE_S, stop_flag):
-            f.send("SET CAP OFF", expect="CAP:")
-            return False, "Stopped"
-        resp_cap = f.send("SET CAP OFF", expect="CAP:")
-        print(f"[serial] SET CAP OFF -> {resp_cap!r}")
-        if not self._step(4, "Brew triggered", status_cb, stop_flag, elapsed=CAP_PULSE_S):
+        resp_cap = f.send("SET CAP PULSE", expect="CAP:", retries=0)
+        elapsed = time.time() - trigger_time
+        print(f"[serial] SET CAP PULSE -> {resp_cap!r}  ({elapsed:.1f}s, 10x low/hi-Z tap)")
+        if not self._step(4, "Brew triggered", status_cb, stop_flag, elapsed=elapsed):
             return False, "Stopped"
 
         outcome, detail = self._wait_for_ring(trigger_time, stop_flag, status_cb)
