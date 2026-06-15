@@ -22,6 +22,10 @@ deploys the app + launcher + firmware, sets it to start on boot, prints a green
 checklist, and reboots. **Plug both ESP32 boards into USB** (before or after — it waits
 for them).
 
+> **Starting completely from scratch** — blank SD card and never-flashed ESP32 boards? See
+> **[INSTALL.md](INSTALL.md)** for the full zero-to-running guide: imaging the Pi, wiring,
+> and the one-time initial ESP32 flash that this command assumes is already done.
+
 After the reboot the app appears, connects to the boards, and flashes them to the latest
 firmware automatically (you'll see a live progress screen). That's the whole setup.
 
@@ -124,6 +128,7 @@ uptime; ps -o pid,etime,cmd -C python3 # is it stable? (not a reboot loop)
 | `flash_splash.py` | Live "updating firmware" progress screen. |
 | `bootscript.py` | Thin autostart shim that execs the launcher. |
 | `pi_install.sh` | The one-shot installer (Section 1). |
+| `INSTALL.md` | Full zero-to-running guide (image the Pi, wire + first-flash the ESP32s). |
 | `PI_SETUP.md` | Detailed/manual setup reference. |
 | `.claude/skills/ota/SKILL.md` | OTA system design, operational rules, and gotchas. |
 
