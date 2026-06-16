@@ -3,3 +3,9 @@ __pycache__/
 *.tmp
 launcher.log
 flashed_firmware.json
+
+# Python build/editable-install metadata (e.g. cadpy editable install)
+*.egg-info/
+
+# Generated CAD viewer/topology sidecars from the cad skill
+cad/.*.step.glb
