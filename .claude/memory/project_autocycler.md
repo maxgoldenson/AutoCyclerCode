@@ -28,19 +28,22 @@ bootId changed or `READY:` seen mid-wait → board reset, dose unknown, NEVER re
 Firmware waits `ACK_SETTLE_MS` (75 ms) after the move before transmitting the ack so it
 isn't sent inside the motor's switching transients. The FRONT firmware has a CAP
 auto-release watchdog (`CAP_MAX_ON_MS`, 15 s) so the brew trigger can never stay asserted
-if the host dies. `CycleRunner.run_one()` always returns servo→REST (gate closed) and
-CAP→OFF on any cycle exit (safe state between cycles). **Idle/done resting state is gate
-OPEN** (`SERVO_OPEN`): the app opens the gate on connect (`_discovery_worker`) and on a
-clean run end / user stop (`_on_finished` → `_set_idle_gate`). NOT opened on `_on_error`
-(the board may be in an unknown state).
+if the host dies. The gate moves **once per series, never per cycle**: it is closed at
+the start of a run (`CycleRunner.close_gate_for_run`, called from `_run_cycles` before the
+loop), stays in the closed (REST) position through every cycle, and reopens only when the
+series ends. `CycleRunner.run_one()` still re-asserts servo→REST (gate closed) and CAP→OFF
+on any cycle exit (`_safe_hardware`, the safe state); since the gate is already at REST
+this never moves it. **Idle/done resting state is gate OPEN** (`SERVO_OPEN`): the app opens
+the gate on connect (`_discovery_worker`) and on a clean run end / user stop
+(`_on_finished` → `_set_idle_gate`). NOT opened on `_on_error` (the board may be in an
+unknown state).
 
-**Cycle sequence:**
-1. GET COLOR — abort if not white (min channel >= 160, spread <= 60)
-2. SET ANGLE 360 — dispense ~19 g
-3. SET SERVO OPEN (default 90°) → 0.5 s → SET SERVO REST (default 0°) → 0.5 s
-4. SET CAP ON — trigger cap-touch (driven LOW)
-5. Wait brew_wait seconds (default 60, configurable in GUI)
-6. SET CAP OFF
+**Cycle sequence** (the gate does NOT move during a cycle — see above):
+1. `SET CAP OFF`; `GET COLOR ERROR` — abort if the machine's error light is on
+2. `SET ANGLE 360` — dispense ~19 g
+3. settle, then poll `GET COLOR RING` until blue (machine idle/ready)
+4. `SET CAP ON` (`CAP_PULSE_S` pulse) → `SET CAP OFF` — trigger the brew
+5. poll `GET COLOR RING` for the green brew-complete flash (ring warnings handled)
 
 **Config persistence:** `autocycler_config.json` in project root saves discovered COM port assignments.
 

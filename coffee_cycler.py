@@ -49,7 +49,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-11 18:19"
+VERSION = "2026-06-24 21:51"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -457,7 +457,7 @@ class CycleRunner:
         while time.time() < deadline:
             if stop_flag.is_set():
                 return False
-            status_cb(4, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
+            status_cb(3, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
             resp = f.send("GET COLOR RING", expect="RGB:")
             if resp.startswith("RGB:"):
                 try:
@@ -568,6 +568,21 @@ class CycleRunner:
         except Exception as e:
             print(f"[safe] cap off failed: {e}")
 
+    def close_gate_for_run(self):
+        """Close the gate ONCE at the start of a brew series. The gate then stays in
+        the closed (REST) position for the entire run — no per-cycle servo motion —
+        and is reopened only when the series finishes (_on_finished -> _set_idle_gate).
+        Best-effort, like the other gate ops: a serial hiccup here is logged but never
+        aborts the run (the first cycle's _safe_hardware would re-assert REST anyway)."""
+        f = self.dev.front
+        if f is None:
+            return
+        try:
+            resp = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
+            print(f"[run] SET SERVO {SERVO_REST} (gate closed for series) -> {resp!r}")
+        except Exception as e:
+            print(f"[run] close gate failed: {e}")
+
     def run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
         """
         Run one full brew cycle. Guarantees that no matter how the cycle ends —
@@ -623,17 +638,11 @@ class CycleRunner:
         if not self._step(2, step_label, status_cb, stop_flag, elapsed):
             return False, "Stopped"
 
-        status_cb(3, "Opening gate...")
-        resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
-        print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
-        if not _sleep(3.0, stop_flag): return False, "Stopped"
-
-        status_cb(3, "Closing gate...")
-        resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
-        print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
-
-        # Gate settle — 1 s gap, then poll until machine shows blue (idle/ready).
-        # CAP stays high-impedance throughout.
+        # The gate does NOT move during a cycle. It is closed exactly once when the
+        # series starts (CycleRunner.close_gate_for_run) and stays closed for the whole
+        # run; it is reopened only when the series finishes (_on_finished ->
+        # _set_idle_gate). Settle 1 s, then poll until the machine shows blue
+        # (idle/ready). CAP stays high-impedance throughout.
         if not _sleep(1.0, stop_flag): return False, "Stopped"
         if not self._wait_for_blue(stop_flag, status_cb): return False, "Stopped"
 
@@ -1533,6 +1542,10 @@ class CoffeeCyclerApp:
                              ring_warning_cb=self._show_ring_warning_dialog)
         self.runner = runner
         try:
+            # Close the gate once for the whole series. It stays closed through every
+            # cycle (no per-cycle gate motion) and is reopened only when the run ends
+            # (_on_finished -> _set_idle_gate). On _on_error it is left closed.
+            runner.close_gate_for_run()
             for i in range(1, total + 1):
                 if self.stop_flag.is_set(): break
                 if i > 1 and (i - 1) % maint_interval == 0:

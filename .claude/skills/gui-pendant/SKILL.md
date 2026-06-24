@@ -98,9 +98,9 @@ Dialogs in this app:
 ## Run lifecycle & safe-state integration
 
 - `_on_start` → prestart dialog → spawn the `_run_cycles` worker.
-- `_run_cycles` (worker) → builds a `CycleRunner`, loops cycles, drives the maintenance
-  pause, marshals every UI update and the terminal `_on_finished` / `_on_error` via
-  `root.after`.
+- `_run_cycles` (worker) → builds a `CycleRunner`, **closes the gate once up front
+  (`runner.close_gate_for_run()`)**, loops cycles, drives the maintenance pause, marshals
+  every UI update and the terminal `_on_finished` / `_on_error` via `root.after`.
 - `_on_finished(stopped)` → `_reset_controls()` then **`_set_idle_gate()` (gate OPEN —
   the idle resting state)**.
 - `_on_error(msg)` → `_reset_controls()` but **does NOT open the gate** (board state is
@@ -108,8 +108,11 @@ Dialogs in this app:
 - `_reset_controls()` → `_clear_busy()` (lets the OTA launcher resume) and re-enables the
   inputs / Start, disables Stop.
 
-The cycle's own safe-hardware guarantees (gate REST + CAP OFF on every cycle exit) live in
-`CycleRunner`; keep the GUI's *idle* resting state (gate **OPEN**) consistent with them.
+The gate moves **once per series, never per cycle**: `close_gate_for_run()` closes it at
+the start of `_run_cycles`, it stays closed for the whole run, and `_set_idle_gate()`
+reopens it only at the end. The cycle's own safe-hardware guarantees (gate REST + CAP OFF
+on every cycle exit) live in `CycleRunner` — since the gate is already at REST, that
+re-assertion never moves it. Keep the GUI's *idle* resting state (gate **OPEN**) consistent.
 
 ## ⭐ OTA "busy" heartbeat (read by the launcher)
 
