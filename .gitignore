@@ -3,3 +3,7 @@ __pycache__/
 *.tmp
 launcher.log
 flashed_firmware.json
+app_busy
+launcher_status.txt
+flash_progress.txt
+notify.json

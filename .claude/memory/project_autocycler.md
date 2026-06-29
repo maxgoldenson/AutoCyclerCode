@@ -51,4 +51,12 @@ the fleet; only a FW_VERSION bump does (bump it on any functional firmware chang
 last-flashed version per board is recorded in `flashed_firmware.json`; a failed/absent
 flash is retried, a success is recorded once and not repeated.
 
+**Notifications (`Notifier`, ntfy):** the app pushes phone alerts to the operator on
+error (`_on_error`), maintenance pause (`_show_maintenance_dialog`), ring warning
+(`_show_ring_warning_dialog`), and natural run completion (`_on_finished`, not on
+user-stop). Config from `notify.json` (`{topic, server, name}`) or env
+(`AUTOCYCLER_NTFY_TOPIC/_SERVER`, `AUTOCYCLER_NAME`); no topic = disabled. Sends are
+best-effort in a daemon thread (never block the UI / fail a cycle). Each alert is titled
+with the cycler name and includes cycle/elapsed/mean context.
+
 **Why:** Auto-discovery probes all COM ports with WHO AM I so user doesn't need to manually set port numbers.

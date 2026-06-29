@@ -266,6 +266,53 @@ def test_send_returns_on_first_match():
     print("PASS: send() returns on first matching response")
 
 
+# --- ntfy notifications ----------------------------------------------------
+def test_notifier_disabled_without_topic():
+    import os
+    os.environ.pop("AUTOCYCLER_NTFY_TOPIC", None)
+    n = cc.Notifier()
+    assert n.enabled is False
+    # A no-op when disabled must not raise even with urlopen unavailable.
+    n.notify("x", "y")
+    print("PASS: notifier disabled (no-op) without a topic")
+
+
+def test_notifier_posts_to_ntfy_when_configured():
+    import os, time as _t
+    os.environ["AUTOCYCLER_NTFY_TOPIC"] = "secret-topic"
+    os.environ["AUTOCYCLER_NTFY_SERVER"] = "https://ntfy.example"
+    os.environ["AUTOCYCLER_NAME"] = "Cycler B"
+    cap = {}
+    def fake_urlopen(req, timeout=None):
+        cap["url"] = req.full_url
+        cap["title"] = req.get_header("Title")
+        cap["priority"] = req.get_header("Priority")
+        cap["tags"] = req.get_header("Tags")
+        cap["body"] = req.data.decode()
+        class _R:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return _R()
+    saved = cc.urllib.request.urlopen
+    cc.urllib.request.urlopen = fake_urlopen
+    try:
+        n = cc.Notifier()
+        assert n.enabled is True
+        n.notify("Run complete -- idle", "All 50 cycles done.",
+                 priority="default", tags=["checkered_flag"])
+        _t.sleep(0.3)   # send runs in a daemon thread
+        assert cap["url"] == "https://ntfy.example/secret-topic", cap.get("url")
+        assert cap["title"] == "Cycler B: Run complete -- idle", cap.get("title")
+        assert cap["priority"] == "default"
+        assert cap["tags"] == "checkered_flag"
+        assert cap["body"] == "All 50 cycles done."
+    finally:
+        cc.urllib.request.urlopen = saved
+        for k in ("AUTOCYCLER_NTFY_TOPIC", "AUTOCYCLER_NTFY_SERVER", "AUTOCYCLER_NAME"):
+            os.environ.pop(k, None)
+    print("PASS: notifier POSTs Title/Priority/Tags/body to the configured topic")
+
+
 if __name__ == "__main__":
     tests = [
         test_happy_path_single_send,
@@ -279,6 +326,8 @@ if __name__ == "__main__":
         test_seq_monotonic_across_dispenses,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,
+        test_notifier_disabled_without_topic,
+        test_notifier_posts_to_ntfy_when_configured,
     ]
     failed = 0
     for t in tests:

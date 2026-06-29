@@ -36,7 +36,9 @@ import time
 import json
 import os
 import random
+import socket
 import datetime
+import urllib.request
 from typing import Optional
 
 try:
@@ -49,7 +51,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-11 18:19"
+VERSION = "2026-06-29 21:42"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +61,14 @@ CONFIG_FILE = os.path.join(_DIR, "autocycler_config.json")
 # brew series is never interrupted by a self-update / flash / reboot.
 BUSY_FILE        = os.path.join(_DIR, "app_busy")
 BUSY_HEARTBEAT_S = 3.0   # how often to refresh BUSY_FILE while a run is active
+
+# Push-notification (ntfy) config — operator gets phone alerts for errors / maintenance /
+# run-finished. Read at startup from notify.json in this dir AND/OR env vars (env wins):
+#   notify.json:  {"topic": "...", "server": "https://ntfy.sh", "name": "Cycler A"}
+#   env:          AUTOCYCLER_NTFY_TOPIC, AUTOCYCLER_NTFY_SERVER, AUTOCYCLER_NAME
+# No topic set -> notifications are silently disabled.
+NOTIFY_FILE       = os.path.join(_DIR, "notify.json")
+NTFY_DEFAULT_SERVER = "https://ntfy.sh"
 
 # -- Serial config -------------------------------------------------------------
 BAUD_RATE         = 115200
@@ -129,6 +139,72 @@ PRESTART_CHECKS = [
     "Front assembly is installed on the machine",
     "Clear and ready to start cycles",
 ]
+
+
+# =============================================================================
+#  Push notifications (ntfy)
+# =============================================================================
+class Notifier:
+    """Sends operator phone alerts via ntfy (https://ntfy.sh or self-hosted). Best-effort:
+    every send runs in a daemon thread with a timeout and swallows errors, so a missing
+    network or a bad topic can never block the UI or fail a cycle. Disabled (no-op) until
+    a topic is configured."""
+
+    def __init__(self):
+        cfg = self._load_config()
+        self.server = (cfg.get("server") or NTFY_DEFAULT_SERVER).rstrip("/")
+        self.topic  = cfg.get("topic") or ""
+        self.name   = cfg.get("name") or socket.gethostname() or "Cycler"
+        self.enabled = bool(self.topic)
+        if self.enabled:
+            print(f"[ntfy] notifications on -> {self.server}/{self.topic} as {self.name!r}")
+        else:
+            print("[ntfy] notifications disabled (set a topic in notify.json or "
+                  "AUTOCYCLER_NTFY_TOPIC)")
+
+    @staticmethod
+    def _load_config() -> dict:
+        cfg = {}
+        try:
+            with open(NOTIFY_FILE) as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+        # env vars win over the file
+        for key, env in (("topic",  "AUTOCYCLER_NTFY_TOPIC"),
+                         ("server", "AUTOCYCLER_NTFY_SERVER"),
+                         ("name",   "AUTOCYCLER_NAME")):
+            val = os.environ.get(env)
+            if val:
+                cfg[key] = val
+        return cfg
+
+    @staticmethod
+    def _ascii(s: str) -> str:
+        # HTTP headers must be ASCII; keep the Title/Tags safe (body can be UTF-8).
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def notify(self, title: str, message: str, priority: str = "default", tags=None):
+        if not self.enabled:
+            return
+
+        def _send():
+            try:
+                req = urllib.request.Request(
+                    f"{self.server}/{self.topic}",
+                    data=message.encode("utf-8"),
+                    headers={
+                        "Title":    self._ascii(f"{self.name}: {title}"),
+                        "Priority": priority,
+                        "Tags":     self._ascii(",".join(tags)) if tags else "",
+                    },
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=10)
+            except Exception as e:
+                print(f"[ntfy] send failed: {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
 
 
 # =============================================================================
@@ -682,8 +758,9 @@ class CoffeeCyclerApp:
     WARNING = "#F59E0B"   # amber-500
 
     def __init__(self, root: tk.Tk):
-        self.root    = root
-        self.devices = DeviceManager()
+        self.root     = root
+        self.devices  = DeviceManager()
+        self.notifier = Notifier()
 
         self.total_cycles       = tk.IntVar(value=10)
         self.ring_wait_min_var  = tk.IntVar(value=DEFAULT_RING_WAIT_MIN_S)
@@ -1389,6 +1466,12 @@ class CoffeeCyclerApp:
             "blue":   "The machine may be in a standby or fault state.",
         }.get(color, "An unexpected ring color was detected.")
 
+        self.notifier.notify(
+            f"{color.title()} ring -- needs attention",
+            f"{warning_msg}\nSensor: {detail}.\n"
+            f"Paused at {self._notify_context()} -- choose Resume / Reset / Stop.",
+            priority="high", tags=["warning"])
+
         def _build():
             dlg = tk.Toplevel(self.root)
             result["dlg"] = dlg
@@ -1455,6 +1538,16 @@ class CoffeeCyclerApp:
         return result["action"]
 
     def _show_maintenance_dialog(self, completed: int):
+        try:
+            total = int(self.total_cycles.get())
+        except Exception:
+            total = completed
+        self.notifier.notify(
+            "Maintenance required -- paused",
+            f"Paused for maintenance after cycle {completed}/{total} "
+            f"({self._notify_context()}).\n"
+            f"Empty coffee & compost, refill, check for leaks, then Resume.",
+            priority="high", tags=["wrench"])
         dlg = tk.Toplevel(self.root)
         dlg.title("Maintenance Required")
         dlg.configure(bg=self.PANEL)
@@ -1618,10 +1711,27 @@ class CoffeeCyclerApp:
             self._set_status("All cycles completed successfully.", self.SUCCESS)
             self.step_value.set("Done")
             self.progress["value"] = 100
+            try:
+                total = int(self.total_cycles.get())
+            except Exception:
+                total = self.current_cycle
+            elapsed = self._fmt_time(int(time.time() - self.start_time)) if self.start_time else "?"
+            extra = ""
+            if self.runner is not None and getattr(self.runner, "mean_cycle_s", 90.0) != 90.0:
+                extra = f" (~{self._fmt_time(int(self.runner.mean_cycle_s))}/cycle)"
+            self.notifier.notify(
+                "Run complete -- idle",
+                f"All {total} cycles done in {elapsed}{extra}.\n"
+                f"Machine is idle and ready for the next batch.",
+                priority="default", tags=["checkered_flag"])
 
     def _on_error(self, msg: str):
         self._reset_controls()
         self._set_status(f"Error: {msg}", self.DANGER)
+        self.notifier.notify(
+            "Error -- run halted",
+            f"{msg}\nHalted at {self._notify_context()}.\nRun stopped; needs attention.",
+            priority="high", tags=["rotating_light"])
 
     def _reset_controls(self):
         self._clear_busy()       # run finished -> let the OTA launcher resume updates
@@ -1644,6 +1754,24 @@ class CoffeeCyclerApp:
             except Exception as e:
                 print(f"[idle] open gate failed: {e}")
         threading.Thread(target=_open, daemon=True).start()
+
+    def _notify_context(self) -> str:
+        """One-line run context for notifications: cycle progress, elapsed, mean cycle."""
+        try:
+            total = int(self.total_cycles.get())
+        except Exception:
+            total = self.current_cycle
+        parts = [f"cycle {self.current_cycle}/{total}"]
+        if self.start_time:
+            parts.append(f"elapsed {self._fmt_time(int(time.time() - self.start_time))}")
+        if self.runner is not None:
+            try:
+                mean = self.runner.mean_cycle_s
+                if mean and mean != 90.0:
+                    parts.append(f"~{self._fmt_time(int(mean))}/cycle")
+            except Exception:
+                pass
+        return ", ".join(parts)
 
     # -- "cycles running" heartbeat (read by the OTA launcher) ----------------
     def _write_busy(self):

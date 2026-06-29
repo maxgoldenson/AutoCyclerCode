@@ -84,6 +84,26 @@ fetch flash_splash.py                               flash_splash.py
 fetch AUTOCYCLER_DISPENSOR/AUTOCYCLER_DISPENSOR.ino AUTOCYCLER_DISPENSOR/AUTOCYCLER_DISPENSOR.ino
 fetch AUTOCYCLER_FRONT/AUTOCYCLER_FRONT.ino         AUTOCYCLER_FRONT/AUTOCYCLER_FRONT.ino
 
+# ── 5b. Push notifications (ntfy) — optional, only if a topic was provided ───
+# Run with:  AUTOCYCLER_NTFY_TOPIC=your-secret-topic AUTOCYCLER_NAME="Cycler 3" \
+#            curl -fsSL .../pi_install.sh | bash
+# Writes notify.json (editable later); leaves an existing one alone if no topic is given.
+if [ -n "${AUTOCYCLER_NTFY_TOPIC:-}" ]; then
+  say "Configuring push notifications (ntfy)"
+  cat > "${DIR}/notify.json" <<JSON
+{
+  "topic":  "${AUTOCYCLER_NTFY_TOPIC}",
+  "server": "${AUTOCYCLER_NTFY_SERVER:-https://ntfy.sh}",
+  "name":   "${AUTOCYCLER_NAME:-$(hostname)}"
+}
+JSON
+  echo "Wrote ${DIR}/notify.json — alerts go to ${AUTOCYCLER_NTFY_SERVER:-https://ntfy.sh}/${AUTOCYCLER_NTFY_TOPIC}"
+elif [ -f "${DIR}/notify.json" ]; then
+  echo "Keeping existing ${DIR}/notify.json"
+else
+  echo "Notifications off (no topic). To enable, see README §Notifications."
+fi
+
 # ── 6. Start on boot (add an autostart entry only if none exists) ───────────
 say "Setting it to start on boot"
 START_CMD="env AUTOCYCLER_DIR=${DIR} AUTOCYCLER_BRANCH=${BRANCH} ESP32_FQBN=${FQBN} python3 ${DIR}/launcher.py"
@@ -116,6 +136,9 @@ chk "firmware sketches deployed"        "test -f '${DIR}/AUTOCYCLER_DISPENSOR/AU
 chk "ModemManager disabled"            "! (systemctl is-enabled ModemManager 2>/dev/null | grep -q enabled)"
 chk "serial access (dialout group)"    "getent group dialout | grep -qw '${USER}'"
 chk "passwordless sudo (auto-reboot)"  "sudo -n true 2>/dev/null"
+# Notifications are optional — report status without failing the install.
+if [ -f "${DIR}/notify.json" ]; then printf '  \033[1;32m[ok]\033[0m  push notifications configured (notify.json)\n'
+else printf '  \033[1;33m[--]\033[0m  push notifications off (optional — see README)\n'; fi
 
 say "Done"
 if [ "${FAILED}" = 0 ]; then

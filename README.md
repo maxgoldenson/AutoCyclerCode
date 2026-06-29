@@ -82,7 +82,43 @@ tail -f ~/autocycler/launcher.log                # live: what the launcher is do
 
 ---
 
-## 5. Updating Pis set up before self-update existed (one-time)
+## 5. Phone notifications (ntfy) — optional but recommended
+
+Each cycler can push an alert to your phone (via [ntfy](https://ntfy.sh)) when it needs a
+human, so the operator knows *which* machine to visit and *why* without walking the room.
+
+**You get notified when:**
+- ⛔ an **error** halts a run (includes the error, cycle reached, elapsed time)
+- 🔧 a **maintenance** pause begins (which cycle, the tasks to do)
+- 🏁 a **run finishes** and the machine is idle (cycle count, total time, mean cycle)
+- ⚠️ a **ring warning** pauses a run waiting for your Resume/Reset/Stop decision
+
+Every alert is titled with the cycler's name, e.g. `Cycler 3: Maintenance required — paused`.
+
+**Set it up (per Pi, ~1 minute):**
+
+1. Pick a **secret topic** name (treat it like a password — anyone who knows it can read
+   your alerts), e.g. `acme-coffee-test-7h3k2`.
+2. Install the **ntfy app** on your phone (iOS/Android) and **subscribe to that topic**.
+3. On the Pi, either pass it to the installer:
+   ```bash
+   AUTOCYCLER_NTFY_TOPIC=acme-coffee-test-7h3k2 AUTOCYCLER_NAME="Cycler 3" \
+     curl -fsSL https://raw.githubusercontent.com/maxgoldenson/AutoCyclerCode/main/pi_install.sh | bash
+   ```
+   …or just create `~/autocycler/notify.json` and reboot:
+   ```json
+   { "topic": "acme-coffee-test-7h3k2", "server": "https://ntfy.sh", "name": "Cycler 3" }
+   ```
+4. Test it: `curl -d "hello from Cycler 3" ntfy.sh/acme-coffee-test-7h3k2` — your phone
+   should buzz.
+
+Use **one shared topic** for the whole fleet (subscribe once, each alert says which cycler)
+or a topic per Pi. `server` may point at a self-hosted ntfy. No topic set → notifications
+are simply off. Notifications never block the app — they're best-effort and time-limited.
+
+---
+
+## 6. Updating Pis set up before self-update existed (one-time)
 
 Older Pis run a launcher that can't self-update. Bring each one onto the self-updating
 launcher **once** — after this it's automatic forever:
@@ -95,7 +131,7 @@ cd ~/autocycler && ok=1; for f in launcher.py bootscript.py flash_splash.py; do 
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 ```bash
 tail -30 ~/autocycler/launcher.log     # the launcher logs every decision here
@@ -104,7 +140,7 @@ uptime; ps -o pid,etime,cmd -C python3 # is it stable? (not a reboot loop)
 
 | Symptom | Likely cause / fix |
 |---|---|
-| App never updates | No internet, or an old pre-self-update launcher (do Section 5). |
+| App never updates | No internet, or an old pre-self-update launcher (do Section 6). |
 | `version 'GLIBC_2.34' not found` when flashing | ESP32 core 3.x on old Pi OS — the installer pins `esp32:esp32@2.0.17`; re-run it. |
 | Board won't connect / `device reports readiness… returned no data` | ModemManager grabbing the port — the installer disables it; re-run it. |
 | Header shows `ESP32 fw … ?` for a board | That board is on old firmware without the version query; it updates on the next flash. |
@@ -113,7 +149,7 @@ uptime; ps -o pid,etime,cmd -C python3 # is it stable? (not a reboot loop)
 
 ---
 
-## 7. What's in the repo
+## 8. What's in the repo
 
 | File | Role |
 |---|---|
