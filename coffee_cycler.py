@@ -51,7 +51,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-06-29 21:42"
+VERSION = "2026-07-20 18:43"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -507,11 +507,12 @@ class CycleRunner:
     STEP_MIN_S  = {1: 2.0, 2: 5.0, 3: 3.0, 4: 1.5}
 
     def __init__(self, devices: DeviceManager, ring_wait_min: int, ring_timeout: int,
-                 ring_warning_cb):
+                 ring_warning_cb, skip_dispense: bool = False):
         self.dev             = devices
         self.ring_wait_min   = ring_wait_min
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
+        self.skip_dispense   = skip_dispense
         self._green_seen  = False
         self._cycle_count = 0
         self._green_times: list = []  # wall-clock timestamps of each green flash
@@ -679,25 +680,32 @@ class CycleRunner:
         if not self._step(1, f"Error light OK  (R={r} G={g} B={b})", status_cb, stop_flag, elapsed):
             return False, "Stopped"
 
-        status_cb(2, "Dispensing ~19 g...")
-        t0 = time.time()
-        outcome, detail = d.dispense(360)
-        elapsed = time.time() - t0
-        print(f"[serial] dispense 360 -> {outcome}: {detail}  ({elapsed:.1f}s)")
-        if outcome == "acked":
-            step_label = f"Dispensed  ({elapsed:.1f}s)"
-        elif outcome == "verified":
-            step_label = f"Dispensed -- ack lost, verified by STATUS ({elapsed:.1f}s)"
-        elif outcome == "reset":
-            # The board rebooted mid-move; the dose is partial/unknown. dispense() never
-            # re-sends in this case (a re-send could double-dispense), so continuing is
-            # overflow-safe: one light cup beats an aborted overnight run.
-            step_label = "Dispenser reset mid-move -- dose may be partial, continuing"
-        else:  # "lost" — no ack AND no STATUS reply: the serial link itself is down,
-               # so later cycles would dispense nothing. Stop with a clear message.
-            return False, f"Dispense failed -- {detail}"
-        if not self._step(2, step_label, status_cb, stop_flag, elapsed):
-            return False, "Stopped"
+        if self.skip_dispense:
+            # Skip-dispense mode: the dispenser board is never commanded this series.
+            print("[cycle] step 2: dispense SKIPPED (skip dispense enabled)")
+            status_cb(2, "Dispense skipped")
+            if not _sleep(1.0, stop_flag):
+                return False, "Stopped"
+        else:
+            status_cb(2, "Dispensing ~19 g...")
+            t0 = time.time()
+            outcome, detail = d.dispense(360)
+            elapsed = time.time() - t0
+            print(f"[serial] dispense 360 -> {outcome}: {detail}  ({elapsed:.1f}s)")
+            if outcome == "acked":
+                step_label = f"Dispensed  ({elapsed:.1f}s)"
+            elif outcome == "verified":
+                step_label = f"Dispensed -- ack lost, verified by STATUS ({elapsed:.1f}s)"
+            elif outcome == "reset":
+                # The board rebooted mid-move; the dose is partial/unknown. dispense() never
+                # re-sends in this case (a re-send could double-dispense), so continuing is
+                # overflow-safe: one light cup beats an aborted overnight run.
+                step_label = "Dispenser reset mid-move -- dose may be partial, continuing"
+            else:  # "lost" — no ack AND no STATUS reply: the serial link itself is down,
+                   # so later cycles would dispense nothing. Stop with a clear message.
+                return False, f"Dispense failed -- {detail}"
+            if not self._step(2, step_label, status_cb, stop_flag, elapsed):
+                return False, "Stopped"
 
         status_cb(3, "Opening gate...")
         resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
@@ -766,6 +774,8 @@ class CoffeeCyclerApp:
         self.ring_wait_min_var  = tk.IntVar(value=DEFAULT_RING_WAIT_MIN_S)
         self.ring_timeout_var   = tk.IntVar(value=DEFAULT_RING_TIMEOUT_S)
         self.maint_interval_var = tk.IntVar(value=50)
+        # Default OFF: the dispenser runs every cycle unless the user opts out.
+        self.skip_dispense_var  = tk.BooleanVar(value=False)
         self.current_cycle    = 0
         self.cycle_thread: Optional[threading.Thread] = None
         self._starting        = False   # guards against re-entrant / double Start
@@ -922,6 +932,16 @@ class CoffeeCyclerApp:
         self.ring_timeout_entry = _cfg_cell(grid_cfg, "Ring timeout (s)",            self.ring_timeout_var,   1, 0, 2)
         self.maint_entry        = _cfg_cell(grid_cfg, "Maintenance every N cycles",  self.maint_interval_var, 1, 1, 3)
 
+        self.skip_dispense_cb = tk.Checkbutton(
+            grid_cfg, text="Skip dispense (dispenser never runs this series)",
+            variable=self.skip_dispense_var,
+            bg=self.PANEL, fg=self.MUTED,
+            activebackground=self.PANEL, activeforeground=self.TEXT,
+            selectcolor=self.PANEL, highlightthickness=0, bd=0,
+            font=("Helvetica", 11), anchor="w")
+        self.skip_dispense_cb.grid(row=2, column=0, columnspan=2, sticky="w")
+        self._pend_labels[4] = self.skip_dispense_cb   # turns green when pendant-focused
+
         # ── Pendant indicator ────────────────────────────────────────────────
         pend = self._panel(outer)
         ttk.Label(pend, text="NUMPAD PENDANT", style="Section.TLabel").pack(anchor="w",
@@ -1036,13 +1056,14 @@ class CoffeeCyclerApp:
         self._pend_items = [
             # Entries first, then Start/Stop — the natural Enter path lands on Start Cycle.
             # Reconnect is last so it is never hit accidentally while navigating.
-            ("entry",  self.cycles_entry,       self.total_cycles,       1,   999, "Number of cycles"),
-            ("entry",  self.ring_min_entry,     self.ring_wait_min_var,  10,  300, "Ring wait min (s)"),
-            ("entry",  self.ring_timeout_entry, self.ring_timeout_var,   30,  600, "Ring timeout (s)"),
-            ("entry",  self.maint_entry,        self.maint_interval_var, 1,   999, "Maintenance interval"),
-            ("button", self.start_btn,          None, None, None, "Start Cycle"),
-            ("button", self.stop_btn,           None, None, None, "Stop"),
-            ("button", self.reconnect_btn,      None, None, None, "Reconnect"),
+            ("entry",    self.cycles_entry,       self.total_cycles,       1,   999, "Number of cycles"),
+            ("entry",    self.ring_min_entry,     self.ring_wait_min_var,  10,  300, "Ring wait min (s)"),
+            ("entry",    self.ring_timeout_entry, self.ring_timeout_var,   30,  600, "Ring timeout (s)"),
+            ("entry",    self.maint_entry,        self.maint_interval_var, 1,   999, "Maintenance interval"),
+            ("checkbox", self.skip_dispense_cb,   self.skip_dispense_var,  None, None, "Skip dispense"),
+            ("button",   self.start_btn,          None, None, None, "Start Cycle"),
+            ("button",   self.stop_btn,           None, None, None, "Stop"),
+            ("button",   self.reconnect_btn,      None, None, None, "Reconnect"),
         ]
 
         # bind_all fires when focus is on a button (buttons don't type, no conflict).
@@ -1054,6 +1075,11 @@ class CoffeeCyclerApp:
                 # <Key> guard fires BEFORE the Entry class binding that inserts chars.
                 # It also catches char-based variants (e.g. 'slash' vs 'KP_Divide').
                 widget.bind("<Key>", self._pend_key_guard)
+            elif kind == "checkbox":
+                # Widget-level Enter runs the pendant handler BEFORE the Checkbutton
+                # class binding and breaks — otherwise Enter would double-toggle.
+                widget.bind("<KP_Enter>", self._pend_enter)
+                widget.bind("<Return>",   self._pend_enter)
             widget.bind("<FocusIn>", lambda _e, idx=i: self._on_widget_focus(idx))
 
         self._pend_focus(0)
@@ -1361,11 +1387,14 @@ class CoffeeCyclerApp:
                     "numbers >= 1.")
                 return
 
+            skip_dispense = bool(self.skip_dispense_var.get())
+
             if not self._show_prestart_dialog():
                 return
 
             for w in (self.cycles_entry, self.ring_min_entry,
-                      self.ring_timeout_entry, self.maint_entry):
+                      self.ring_timeout_entry, self.maint_entry,
+                      self.skip_dispense_cb):
                 w.configure(state="disabled")
             self.start_btn.configure(state="disabled")
             self.reconnect_btn.configure(state="disabled")
@@ -1381,7 +1410,7 @@ class CoffeeCyclerApp:
                                  # check can't slip in between start and the first tick
             self.cycle_thread = threading.Thread(
                 target=self._run_cycles,
-                args=(n, ring_wait_min, ring_timeout, maint_interval),
+                args=(n, ring_wait_min, ring_timeout, maint_interval, skip_dispense),
                 daemon=True,
             )
             self.cycle_thread.start()
@@ -1620,10 +1649,11 @@ class CoffeeCyclerApp:
     #  Cycle execution
     # =========================================================================
     def _run_cycles(self, total: int, ring_wait_min: int, ring_timeout: int,
-                    maint_interval: int):
+                    maint_interval: int, skip_dispense: bool = False):
         runner = CycleRunner(self.devices, ring_wait_min=ring_wait_min,
                              ring_timeout=ring_timeout,
-                             ring_warning_cb=self._show_ring_warning_dialog)
+                             ring_warning_cb=self._show_ring_warning_dialog,
+                             skip_dispense=skip_dispense)
         self.runner = runner
         try:
             for i in range(1, total + 1):
@@ -1736,7 +1766,8 @@ class CoffeeCyclerApp:
     def _reset_controls(self):
         self._clear_busy()       # run finished -> let the OTA launcher resume updates
         for w in (self.cycles_entry, self.ring_min_entry,
-                  self.ring_timeout_entry, self.maint_entry):
+                  self.ring_timeout_entry, self.maint_entry,
+                  self.skip_dispense_cb):
             w.configure(state="normal")
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")

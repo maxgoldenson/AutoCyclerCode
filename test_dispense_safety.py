@@ -250,6 +250,66 @@ def test_seq_monotonic_across_dispenses():
     print("PASS: seq increments per dispense")
 
 
+# --- skip-dispense mode -----------------------------------------------------
+class FrontBoard:
+    """Front-assembly model for full-cycle tests: ring reads blue (machine ready)
+    until the brew is triggered via CAP, green (brew complete) afterwards."""
+    def __init__(self):
+        self.cap_pulses = 0
+
+    def __call__(self, cmd):
+        if cmd.startswith("SET CAP ON"):
+            self.cap_pulses += 1
+            return [b"CAP:ON\n"]
+        if cmd.startswith("SET CAP OFF"):
+            return [b"CAP:OFF\n"]
+        if cmd.startswith("SET SERVO"):
+            return [b"SERVO:OK\n"]
+        if cmd.startswith("GET COLOR ERROR"):
+            return [b"RGB:10,10,10\n"]
+        if cmd.startswith("GET COLOR RING"):
+            if self.cap_pulses:
+                return [b"RGB:10,220,10\n"]   # green -- brew complete
+            return [b"RGB:10,10,220\n"]       # blue  -- machine ready
+        return [f"UNKNOWN:{cmd}\n".encode()]
+
+
+def _run_full_cycle(skip_dispense: bool):
+    """One complete CycleRunner cycle against fake boards, sleeps patched out.
+    Returns (ok, msg, dispenser_writes)."""
+    front = _make_device(FrontBoard())
+    disp  = _make_device(Board())
+    dm    = types.SimpleNamespace(dispenser=disp, front=front)
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=5,
+                            ring_warning_cb=lambda _c, _d: "resume",
+                            skip_dispense=skip_dispense)
+    orig_sleep = cc._sleep
+    cc._sleep = lambda _secs, stop_flag: not stop_flag.is_set()
+    try:
+        ok, msg = runner.run_one(stop_flag=threading.Event(),
+                                 status_cb=lambda _n, _lbl: None)
+    finally:
+        cc._sleep = orig_sleep
+    return ok, msg, disp._ser.writes
+
+
+def test_skip_dispense_never_commands_dispenser():
+    ok, msg, disp_writes = _run_full_cycle(skip_dispense=True)
+    assert ok, msg
+    assert disp_writes == [], disp_writes
+    print("PASS: skip dispense -> full cycle completes, dispenser never commanded")
+
+
+def test_skip_dispense_off_by_default_still_dispenses():
+    dm_probe = types.SimpleNamespace(dispenser=None, front=None)
+    assert cc.CycleRunner(dm_probe, 0, 5, None).skip_dispense is False
+    ok, msg, disp_writes = _run_full_cycle(skip_dispense=False)
+    assert ok, msg
+    angle = [w for w in disp_writes if w.startswith("SET ANGLE")]
+    assert angle == ["SET ANGLE 360 101"], disp_writes
+    print("PASS: skip dispense defaults off -> cycle still dispenses once")
+
+
 def test_send_still_retries_idempotent_commands():
     dev = _make_device(lambda cmd: [])   # never answers
     resp = dev.send("GET COLOR RING", expect="RGB:", retries=2)
@@ -324,6 +384,8 @@ if __name__ == "__main__":
         test_old_firmware_no_status_no_resend,
         test_garbage_during_ack_wait_still_verified,
         test_seq_monotonic_across_dispenses,
+        test_skip_dispense_never_commands_dispenser,
+        test_skip_dispense_off_by_default_still_dispenses,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,
         test_notifier_disabled_without_topic,
