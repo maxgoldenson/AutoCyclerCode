@@ -55,7 +55,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-27 11:05"
+VERSION = "2026-07-27 11:40"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -833,6 +833,7 @@ class CoffeeCyclerApp:
 
         # Pendant state
         self._pend_labels: dict = {}           # idx → tk.Label whose fg turns green when focused
+        self._pend_rest_fg: dict = {}          # idx → fg when NOT focused (default MUTED)
         # Items: (kind, widget, var, lo, hi, label)
         #   kind  'entry' | 'button' | 'checkbox' | 'toggle' (machine-mode switch)
         #   var   IntVar (entry) | None (button) | BooleanVar (checkbox) | StringVar (toggle)
@@ -974,15 +975,27 @@ class CoffeeCyclerApp:
         self.ring_timeout_entry = _cfg_cell(grid_cfg, "Ring timeout (s)",            self.ring_timeout_var,   1, 0, 2)
         self.maint_entry        = _cfg_cell(grid_cfg, "Maintenance every N cycles",  self.maint_interval_var, 1, 1, 3)
 
+        # Deliberately the loudest control in this panel: skipping the dispense is easy
+        # to leave armed by accident and silently ruins a whole series. Large bold text
+        # at full contrast, and the ON state also turns the text amber (see
+        # _on_skip_dispense_toggle) so an armed skip is obvious across the room.
+        # selectcolor must stay DARK: Tk paints the indicator interior with it in BOTH
+        # states here, so a bright value makes checked and unchecked look alike.
         self.skip_dispense_cb = tk.Checkbutton(
             grid_cfg, text="Skip dispense (dispenser never runs this series)",
             variable=self.skip_dispense_var,
-            bg=self.PANEL, fg=self.MUTED,
+            bg=self.PANEL, fg=self.TEXT,
             activebackground=self.PANEL, activeforeground=self.TEXT,
-            selectcolor=self.PANEL, highlightthickness=0, bd=0,
-            font=("Helvetica", 11), anchor="w")
-        self.skip_dispense_cb.grid(row=2, column=0, columnspan=2, sticky="w")
+            selectcolor=self.BG, highlightthickness=0, bd=0,
+            font=("Helvetica", 18, "bold"), anchor="w", padx=0, pady=6)
+        self.skip_dispense_cb.grid(row=2, column=0, columnspan=2, sticky="w",
+                                   pady=(6, 0))
         self._pend_labels[4] = self.skip_dispense_cb   # turns green when pendant-focused
+        self._pend_rest_fg[4] = self.TEXT              # ...and stays bright when it isn't
+        # Trace, not command=: this fires however the value changes — touch, pendant
+        # Enter (which sets the var directly), or a programmatic reset.
+        self.skip_dispense_var.trace_add("write",
+                                         lambda *_a: self._on_skip_dispense_toggle())
 
         # ── Machine-mode switch (2.2.x / 3.0) ────────────────────────────────
         # Two tappable segments acting as one selector; the choice reorders the
@@ -1220,10 +1233,12 @@ class CoffeeCyclerApp:
         self._pend_update_highlight()
 
     def _pend_update_highlight(self):
-        """Turn the focused field's label green; all others revert to muted."""
+        """Turn the focused field's label green; all others revert to their resting
+        color (muted unless the field opted into a brighter one via _pend_rest_fg)."""
         for i, lbl in self._pend_labels.items():
             try:
-                lbl.configure(fg=self.SUCCESS if i == self._pend_idx else self.MUTED)
+                lbl.configure(fg=self.SUCCESS if i == self._pend_idx
+                              else self._pend_rest_fg.get(i, self.MUTED))
             except tk.TclError:
                 pass
 
@@ -1563,6 +1578,14 @@ class CoffeeCyclerApp:
 
         self.root.wait_window(dlg)
         return result["ok"]
+
+    def _on_skip_dispense_toggle(self):
+        """Armed skip-dispense repaints the row amber; off returns it to full white.
+        (Pendant focus still wins while the row is focused — focus is transient, the
+        resting color is what the operator sees at a glance.)"""
+        armed = bool(self.skip_dispense_var.get())
+        self._pend_rest_fg[4] = self.WARNING if armed else self.TEXT
+        self._pend_update_highlight()
 
     # =========================================================================
     #  Machine-mode switch (2.2.x / 3.0)
