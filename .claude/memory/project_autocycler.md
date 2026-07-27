@@ -34,14 +34,14 @@ OPEN** (`SERVO_OPEN`): the app opens the gate on connect (`_discovery_worker`) a
 clean run end / user stop (`_on_finished` → `_set_idle_gate`). NOT opened on `_on_error`
 (the board may be in an unknown state).
 
-**Cycle sequence** (machine-mode switch in the GUI, persisted as `machine_mode` in
-`autocycler_config.json`; CycleRunner `machine=`):
-- **2.2.x**: GET COLOR ERROR (abort if red) → SET ANGLE 360 (~19 g) → servo OPEN → 3 s
-  → REST → wait blue ring → CAP ON pulse → poll for green flash
-- **3.0**: dispense FIRST, then door OPEN/REST, then the error check, then blue/cap —
-  delivery lands right after the previous green flash
+**Cycle sequence** (2.2.x order — the only one the app can run):
+GET COLOR ERROR (abort if red) → SET ANGLE 360 (~19 g) → servo OPEN → 3 s → REST
+→ wait blue ring → CAP ON pulse → poll for green flash.
 - Green-flash timeout (`ring_timeout`, default 120 s) halts the run as an ERROR
   (red status + ntfy alert); it no longer proceeds to the next cycle.
+- A 3.0 op order exists in `CycleRunner(machine="3.0")` (dispense → door → error check)
+  but is **deliberately unreachable — no UI selector, nothing sets it**. Shelved pending
+  confirmation against a real machine: `docs/machine_mode_3_0.md`.
 
 **Config persistence:** `autocycler_config.json` in project root saves discovered COM port assignments.
 

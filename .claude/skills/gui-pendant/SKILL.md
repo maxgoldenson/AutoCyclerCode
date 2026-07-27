@@ -32,9 +32,9 @@ only reproduce under load.
 
 A numpad with no modifiers drives the whole UI. `_pend_items` is the ordered list of
 focusable rows for the current screen — tuples of
-`(kind, widget, var, lo, hi, label)` where `kind` is `entry` / `button` / `checkbox` /
-`toggle` (the machine-mode 2.2.x/3.0 switch: Enter flips its StringVar in place via
-`_set_machine_mode`, which restyles the segments and persists the choice).
+`(kind, widget, var, lo, hi, label)` where `kind` is `entry` / `button` / `checkbox`.
+(A fourth `toggle` kind for a segmented 2.2.x/3.0 switch is written up in
+`docs/machine_mode_3_0.md` — shelved, not in the code.)
 Order matters: entries first, then `Start` / `Stop` / `Reconnect`, so walking with Enter
 lands on **Start Cycle** and `Reconnect` is last (never hit by accident).
 
