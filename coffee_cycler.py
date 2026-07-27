@@ -34,12 +34,14 @@ Numpad pendant controls (always active):
 
 import tkinter as tk
 from tkinter import ttk, messagebox
+import tkinter.font as tkfont
 import threading
 import time
 import json
 import os
 import random
 import socket
+import tempfile
 import datetime
 import urllib.request
 from typing import Optional
@@ -54,7 +56,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-27 12:10"
+VERSION = "2026-07-27 12:35"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -793,6 +795,111 @@ class CycleRunner:
 
 
 # =============================================================================
+#  Font-scaled checkbox indicator
+# =============================================================================
+# Tk's native X11 checkbutton indicator is hard-pinned at 11x11 px at EVERY font
+# size (measured: 11 pt -> 11 px, 18 pt -> 11 px, 32 pt -> 11 px), so beside the
+# 18 pt Skip-dispense label it renders at 61% of the text's cap height and sits
+# 7 px below the cap line. These helpers draw the box as an X11 BITMAP sized from
+# the label font's own metrics, so it matches the text at any font or DPI.
+#
+# Why -bitmap rather than -image: Tk on X11 unconditionally stipples a DISABLED
+# -image into a gray50 checkerboard with no option to suppress it, and this
+# widget is disabled for the whole duration of a run. A -bitmap is exempt (it is
+# drawn in -disabledforeground instead), so the start/stop lifecycle code needs
+# no changes. A bitmap is also painted in the widget's -fg, so the pendant's
+# green focus highlight and the amber "armed" color recolor the BOX along with
+# the text, for free.
+# Why not a Unicode ballot box (U+2610/2611): the font Tk resolves may not
+# contain it -- "Helvetica" resolves to Nimbus Sans here, which does not -- and a
+# missing glyph renders BLANK, which would make an armed skip look disarmed.
+
+def _xbm_source(name: str, w: int, h: int, grid) -> str:
+    """Serialize a 0/1 pixel grid as X11 XBM text (LSB-first within each byte)."""
+    out = []
+    for row in grid:
+        for byte_i in range((w + 7) // 8):
+            v = 0
+            for bit in range(8):
+                i = byte_i * 8 + bit
+                if i < w and row[i]:
+                    v |= 1 << bit
+            out.append(v)
+    return (f"#define {name}_width {w}\n#define {name}_height {h}\n"
+            f"static unsigned char {name}_bits[] = {{\n"
+            + ",".join(f"0x{v:02x}" for v in out) + "};\n")
+
+
+def _box_grid(n: int, gap: int, pad_top: int, pad_bottom: int, checked: bool):
+    """An n x n box outline (+ a checkmark when checked) as a 0/1 grid, with
+    transparent padding so the box sits on the text baseline and `gap`
+    transparent columns separating it from the label."""
+    w, h = n + gap, n + pad_top + pad_bottom
+    g = [[0] * w for _ in range(h)]
+    border = max(2, round(n / 9.0))
+    for y in range(n):
+        for x in range(n):
+            if x < border or y < border or x >= n - border or y >= n - border:
+                g[y + pad_top][x] = 1
+    if checked:
+        weight = max(2, round(n / 6.0))
+        c0, c1 = border + 2, n - 3 - border   # keep the tick clear of the border
+        span = c1 - c0
+
+        def pen(px, py):
+            for yy in range(py - weight // 2, py - weight // 2 + weight):
+                for xx in range(px - weight // 2, px - weight // 2 + weight):
+                    if border <= xx < n - border and border <= yy < n - border:
+                        g[yy + pad_top][xx] = 1
+
+        def line(x0, y0, x1, y1):             # Bresenham -- no AA, stays crisp
+            dx, dy = abs(x1 - x0), -abs(y1 - y0)
+            sx = 1 if x0 < x1 else -1
+            sy = 1 if y0 < y1 else -1
+            err = dx + dy
+            x, y = x0, y0
+            while True:
+                pen(x, y)
+                if x == x1 and y == y1:
+                    break
+                e2 = 2 * err
+                if e2 >= dy:
+                    err += dy; x += sx
+                if e2 <= dx:
+                    err += dx; y += sy
+
+        line(c0, c0 + round(0.45 * span), c0 + round(0.36 * span), c1)
+        line(c0 + round(0.36 * span), c1, c1, c0)
+    return w, h, g
+
+
+def _make_checkbox_bitmaps(font_obj) -> tuple[int, str, str]:
+    """-> (box_px, unchecked_spec, checked_spec), the specs being '@/path.xbm'.
+
+    Size and placement come from the font at RUNTIME (never a pixel constant), so
+    the box tracks whatever family Tk resolves and whatever DPI the Pi reports.
+    """
+    ascent    = int(font_obj.metrics("ascent"))
+    linespace = int(font_obj.metrics("linespace"))
+    n   = max(12, ascent - 1)          # measured: cap height == ascent - 1
+    gap = max(8, n // 2)               # transparent columns before the text
+    # The bitmap is one line box tall with the box bottom on the baseline, which
+    # puts the box top exactly on the cap line.
+    pad_top    = max(0, ascent - n)
+    pad_bottom = max(0, linespace - n - pad_top)
+    out_dir = tempfile.mkdtemp(prefix="autocycler_cb_")
+    specs = []
+    for checked in (False, True):
+        w, h, grid = _box_grid(n, gap, pad_top, pad_bottom, checked)
+        name = f"cbx{n}_{int(checked)}"
+        path = os.path.join(out_dir, name + ".xbm")
+        with open(path, "w") as fh:
+            fh.write(_xbm_source(name, w, h, grid))
+        specs.append("@" + path)
+    return n, specs[0], specs[1]
+
+
+# =============================================================================
 #  GUI
 # =============================================================================
 class CoffeeCyclerApp:
@@ -976,19 +1083,34 @@ class CoffeeCyclerApp:
 
         # Deliberately the loudest control in this panel: skipping the dispense is easy
         # to leave armed by accident and silently ruins a whole series. Large bold text
-        # at full contrast, and the ON state also turns the text amber (see
+        # at full contrast, an indicator box scaled to the text (see
+        # _make_checkbox_bitmaps), and the ON state turns both amber (see
         # _on_skip_dispense_toggle) so an armed skip is obvious across the room.
-        # selectcolor must stay DARK: Tk paints the indicator interior with it in BOTH
-        # states here, so a bright value makes checked and unchecked look alike.
+        skip_font = tkfont.Font(root=grid_cfg, family="Helvetica", size=18, weight="bold")
+        _box_px, self._skip_bmp_off, self._skip_bmp_on = _make_checkbox_bitmaps(skip_font)
         self.skip_dispense_cb = tk.Checkbutton(
             grid_cfg, text="Skip dispense (dispenser never runs this series)",
-            variable=self.skip_dispense_var,
+            variable=self.skip_dispense_var, font=skip_font,
+            bitmap=self._skip_bmp_off, compound="left",
+            indicatoron=False,          # drop Tk's fixed 11x11 native indicator
             bg=self.PANEL, fg=self.TEXT,
             activebackground=self.PANEL, activeforeground=self.TEXT,
-            selectcolor=self.BG, highlightthickness=0, bd=0,
-            font=("Helvetica", 18, "bold"), anchor="w", padx=0, pady=6)
+            disabledforeground=self.MUTED,
+            # With indicatoron=False, selectcolor is the WHOLE-WIDGET background when
+            # checked (not the indicator interior), so it must equal the panel color
+            # or the checked row paints itself as a filled slab.
+            selectcolor=self.PANEL,
+            relief="flat", offrelief="flat", overrelief="flat",
+            highlightthickness=0, bd=0, anchor="w", padx=0, pady=6)
         self.skip_dispense_cb.grid(row=2, column=0, columnspan=2, sticky="w",
                                    pady=(6, 0))
+        # Hold a live Tk refcount on BOTH bitmaps via never-mapped labels. Tk caches a
+        # parsed bitmap only while referenced; without this the first toggle re-reads
+        # the file, and a /tmp cleaner on a kiosk that runs for weeks turns that toggle
+        # into "TclError: error reading bitmap file".
+        self.skip_dispense_cb._bmp_anchors = (
+            tk.Label(grid_cfg, bitmap=self._skip_bmp_off),
+            tk.Label(grid_cfg, bitmap=self._skip_bmp_on))
         self._pend_labels[4] = self.skip_dispense_cb   # turns green when pendant-focused
         self._pend_rest_fg[4] = self.TEXT              # ...and stays bright when it isn't
         # Trace, not command=: this fires however the value changes — touch, pendant
@@ -1213,9 +1335,13 @@ class CoffeeCyclerApp:
         """Turn the focused field's label green; all others revert to their resting
         color (muted unless the field opted into a brighter one via _pend_rest_fg)."""
         for i, lbl in self._pend_labels.items():
+            color = (self.SUCCESS if i == self._pend_idx
+                     else self._pend_rest_fg.get(i, self.MUTED))
             try:
-                lbl.configure(fg=self.SUCCESS if i == self._pend_idx
-                              else self._pend_rest_fg.get(i, self.MUTED))
+                # activeforeground too: the Skip-dispense row is a real Checkbutton, so
+                # without it a touch (which leaves the pointer inside the widget) repaints
+                # the row in the stale active color and hides the amber armed warning.
+                lbl.configure(fg=color, activeforeground=color)
             except tk.TclError:
                 pass
 
@@ -1546,10 +1672,13 @@ class CoffeeCyclerApp:
         return result["ok"]
 
     def _on_skip_dispense_toggle(self):
-        """Armed skip-dispense repaints the row amber; off returns it to full white.
-        (Pendant focus still wins while the row is focused — focus is transient, the
-        resting color is what the operator sees at a glance.)"""
+        """Armed skip-dispense repaints the row amber and swaps in the checked box;
+        off returns it to full white. (Pendant focus still wins while the row is
+        focused — focus is transient, the resting color is what the operator sees
+        at a glance.)"""
         armed = bool(self.skip_dispense_var.get())
+        self.skip_dispense_cb.configure(
+            bitmap=self._skip_bmp_on if armed else self._skip_bmp_off)
         self._pend_rest_fg[4] = self.WARNING if armed else self.TEXT
         self._pend_update_highlight()
 

@@ -48,12 +48,16 @@ _tk.TclError = _TclError
 def _dummy(*a, **k):
     return None
 _tk.__getattr__ = lambda _name: _dummy  # type: ignore[attr-defined]
+_tk.__path__ = []           # make it a package so `import tkinter.font` resolves
 _ttk = _stub_module("tkinter.ttk")
 _ttk.__getattr__ = lambda _name: _dummy  # type: ignore[attr-defined]
 _msg = _stub_module("tkinter.messagebox")
 _msg.__getattr__ = lambda _name: _dummy  # type: ignore[attr-defined]
+_tkfont = _stub_module("tkinter.font")
+_tkfont.__getattr__ = lambda _name: _dummy  # type: ignore[attr-defined]
 _tk.ttk = _ttk
 _tk.messagebox = _msg
+_tk.font = _tkfont
 
 import coffee_cycler as cc  # noqa: E402
 
