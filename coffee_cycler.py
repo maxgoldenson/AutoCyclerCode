@@ -5,15 +5,19 @@ Tkinter GUI for running automated brew cycles over serial.
 Devices are auto-discovered by their WHO AM I response and the
 COM port assignments are persisted to autocycler_config.json.
 
-Cycle sequence per brew:
+Cycle sequence per brew -- machine mode 2.2.x (UI-selectable switch):
   1. GET COLOR ERROR  -- abort if error light is red/orange/yellow
   2. SET ANGLE 360    -- dispense ~19 g
-  3. Servo OPEN -> 1 s -> CLOSE
-  4. SET CAP ON -> brief pulse -> SET CAP OFF  -- trigger machine brew cycle
+  3. Servo OPEN -> 3 s -> CLOSE
+  4. Wait for blue (ready), SET CAP ON -> pulse -> OFF  -- trigger machine brew
   5. Wait RING_WAIT_MIN_S, then poll Ring sensor for green completion flash
      * Green flash   -> proceed to next cycle
      * Warning color -> pause and prompt user (resume / reset / stop)
      * Timeout       -> assume the brew failed: halt the run as an error
+
+Machine mode 3.0 reorders delivery so the door cycles right after the previous
+green flash: dispense (before the door opens) -> door OPEN -> CLOSE -> error
+light check -> blue wait -> cap pulse -> green wait.
 
 Numpad pendant controls (always active):
   8 / 2       navigate up / down between fields
@@ -51,7 +55,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-27 10:15"
+VERSION = "2026-07-27 11:05"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -417,7 +421,9 @@ class DeviceManager:
         return {}
 
     def _save_config(self):
-        cfg = {}
+        # Re-read first: the file also carries app-level keys (e.g. machine_mode)
+        # that a port re-discovery must not wipe.
+        cfg = self._load_config()
         if self.dispenser: cfg[ID_DISPENSER] = self.dispenser.port
         if self.front:     cfg[ID_FRONT]     = self.front.port
         try:
@@ -504,15 +510,15 @@ def _sleep(seconds: float, stop_flag: threading.Event) -> bool:
 
 class CycleRunner:
     TOTAL_STEPS = 5
-    STEP_MIN_S  = {1: 2.0, 2: 5.0, 3: 3.0, 4: 1.5}
 
     def __init__(self, devices: DeviceManager, ring_wait_min: int, ring_timeout: int,
-                 ring_warning_cb, skip_dispense: bool = False):
+                 ring_warning_cb, skip_dispense: bool = False, machine: str = "2.2"):
         self.dev             = devices
         self.ring_wait_min   = ring_wait_min
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
         self.skip_dispense   = skip_dispense
+        self.machine         = machine   # "2.2" (legacy order) or "3.0"
         self._green_seen  = False
         self._cycle_count = 0
         self._green_times: list = []  # wall-clock timestamps of each green flash
@@ -621,9 +627,11 @@ class CycleRunner:
         status_cb(5, "Resetting -- waiting 30s...")
         return _sleep(30.0, stop_flag)
 
-    def _step(self, num, label, status_cb, stop_flag, elapsed=0.0) -> bool:
+    def _step(self, num, label, status_cb, stop_flag, elapsed=0.0, hold=1.0) -> bool:
+        # hold is per-OPERATION, passed by the caller: step numbers no longer map to
+        # fixed operations now that machine mode 3.0 reorders the cycle.
         status_cb(num, label)
-        hold = max(0.0, self.STEP_MIN_S.get(num, 1.0) - elapsed)
+        hold = max(0.0, hold - elapsed)
         print(f"[cycle] step {num}: {label}  (hold {hold:.1f}s)")
         return _sleep(hold, stop_flag)
 
@@ -657,14 +665,13 @@ class CycleRunner:
         finally:
             self._safe_hardware()
 
-    def _run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
-        self._cycle_count += 1
-        d, f = self.dev.dispenser, self.dev.front
+    # -- Reorderable cycle operations. Each returns None to continue the cycle, or
+    #    the (ok, msg) tuple _run_one must exit with. `num` is the UI step number,
+    #    assigned by the mode's op order so the progress display always ascends.
 
-        # Guarantee CAP is high-impedance at the start of every cycle
-        f.send("SET CAP OFF", expect="CAP:")
-
-        status_cb(1, "Checking error light...")
+    def _check_error_light(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
+        f = self.dev.front
+        status_cb(num, "Checking error light...")
         t0   = time.time()
         resp = f.send("GET COLOR ERROR", expect="RGB:")
         print(f"[serial] GET COLOR ERROR -> {resp!r}")
@@ -677,44 +684,71 @@ class CycleRunner:
             return False, f"Bad RGB response: {resp}"
         if self._is_color_error(r, g, b):
             return False, f"Error light on -- aborting (R={r} G={g} B={b})"
-        if not self._step(1, f"Error light OK  (R={r} G={g} B={b})", status_cb, stop_flag, elapsed):
+        if not self._step(num, f"Error light OK  (R={r} G={g} B={b})", status_cb,
+                          stop_flag, elapsed, hold=2.0):
             return False, "Stopped"
+        return None
 
+    def _dispense_step(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
         if self.skip_dispense:
             # Skip-dispense mode: the dispenser board is never commanded this series.
-            print("[cycle] step 2: dispense SKIPPED (skip dispense enabled)")
-            status_cb(2, "Dispense skipped")
+            print(f"[cycle] step {num}: dispense SKIPPED (skip dispense enabled)")
+            status_cb(num, "Dispense skipped")
             if not _sleep(1.0, stop_flag):
                 return False, "Stopped"
-        else:
-            status_cb(2, "Dispensing ~19 g...")
-            t0 = time.time()
-            outcome, detail = d.dispense(360)
-            elapsed = time.time() - t0
-            print(f"[serial] dispense 360 -> {outcome}: {detail}  ({elapsed:.1f}s)")
-            if outcome == "acked":
-                step_label = f"Dispensed  ({elapsed:.1f}s)"
-            elif outcome == "verified":
-                step_label = f"Dispensed -- ack lost, verified by STATUS ({elapsed:.1f}s)"
-            elif outcome == "reset":
-                # The board rebooted mid-move; the dose is partial/unknown. dispense() never
-                # re-sends in this case (a re-send could double-dispense), so continuing is
-                # overflow-safe: one light cup beats an aborted overnight run.
-                step_label = "Dispenser reset mid-move -- dose may be partial, continuing"
-            else:  # "lost" — no ack AND no STATUS reply: the serial link itself is down,
-                   # so later cycles would dispense nothing. Stop with a clear message.
-                return False, f"Dispense failed -- {detail}"
-            if not self._step(2, step_label, status_cb, stop_flag, elapsed):
-                return False, "Stopped"
+            return None
+        status_cb(num, "Dispensing ~19 g...")
+        t0 = time.time()
+        outcome, detail = self.dev.dispenser.dispense(360)
+        elapsed = time.time() - t0
+        print(f"[serial] dispense 360 -> {outcome}: {detail}  ({elapsed:.1f}s)")
+        if outcome == "acked":
+            step_label = f"Dispensed  ({elapsed:.1f}s)"
+        elif outcome == "verified":
+            step_label = f"Dispensed -- ack lost, verified by STATUS ({elapsed:.1f}s)"
+        elif outcome == "reset":
+            # The board rebooted mid-move; the dose is partial/unknown. dispense() never
+            # re-sends in this case (a re-send could double-dispense), so continuing is
+            # overflow-safe: one light cup beats an aborted overnight run.
+            step_label = "Dispenser reset mid-move -- dose may be partial, continuing"
+        else:  # "lost" — no ack AND no STATUS reply: the serial link itself is down,
+               # so later cycles would dispense nothing. Stop with a clear message.
+            return False, f"Dispense failed -- {detail}"
+        if not self._step(num, step_label, status_cb, stop_flag, elapsed, hold=5.0):
+            return False, "Stopped"
+        return None
 
-        status_cb(3, "Opening gate...")
+    def _door_cycle(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
+        f = self.dev.front
+        status_cb(num, "Opening gate...")
         resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
         if not _sleep(3.0, stop_flag): return False, "Stopped"
-
-        status_cb(3, "Closing gate...")
+        status_cb(num, "Closing gate...")
         resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
+        return None
+
+    def _run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
+        self._cycle_count += 1
+        f = self.dev.front
+
+        # Guarantee CAP is high-impedance at the start of every cycle
+        f.send("SET CAP OFF", expect="CAP:")
+
+        if self.machine == "3.0":
+            # 3.0: deliver the dose as soon as possible after the previous green flash
+            # -- dispense (lands on the closed door), cycle the door, and only then run
+            # the pre-brew error check. Note the error check runs AFTER the dispense in
+            # this mode, so an errored machine costs one staged dose before the abort.
+            order = (self._dispense_step, self._door_cycle, self._check_error_light)
+        else:
+            # 2.2.x: legacy order -- pre-flight error check, dispense, door cycle.
+            order = (self._check_error_light, self._dispense_step, self._door_cycle)
+        for num, op in enumerate(order, start=1):
+            early_exit = op(num, stop_flag, status_cb)
+            if early_exit is not None:
+                return early_exit
 
         # Gate settle — 1 s gap, then poll until machine shows blue (idle/ready).
         # CAP stays high-impedance throughout.
@@ -729,7 +763,8 @@ class CycleRunner:
             return False, "Stopped"
         resp_cap = f.send("SET CAP OFF", expect="CAP:")
         print(f"[serial] SET CAP OFF -> {resp_cap!r}")
-        if not self._step(4, "Brew triggered", status_cb, stop_flag, elapsed=CAP_PULSE_S):
+        if not self._step(4, "Brew triggered", status_cb, stop_flag,
+                          elapsed=CAP_PULSE_S, hold=1.5):
             return False, "Stopped"
 
         outcome, detail = self._wait_for_ring(trigger_time, stop_flag, status_cb)
@@ -780,6 +815,9 @@ class CoffeeCyclerApp:
         self.maint_interval_var = tk.IntVar(value=50)
         # Default OFF: the dispenser runs every cycle unless the user opts out.
         self.skip_dispense_var  = tk.BooleanVar(value=False)
+        # Machine mode ("2.2" or "3.0") decides the cycle op order. Persisted in the
+        # config file so an OTA restart / reboot can't silently revert the selection.
+        self.machine_mode_var   = tk.StringVar(value=self._load_machine_mode())
         self.current_cycle    = 0
         self.cycle_thread: Optional[threading.Thread] = None
         self._starting        = False   # guards against re-entrant / double Start
@@ -796,8 +834,8 @@ class CoffeeCyclerApp:
         # Pendant state
         self._pend_labels: dict = {}           # idx → tk.Label whose fg turns green when focused
         # Items: (kind, widget, var, lo, hi, label)
-        #   kind  'entry' | 'button' | 'checkbox'
-        #   var   IntVar (entry) | None (button) | BooleanVar (checkbox)
+        #   kind  'entry' | 'button' | 'checkbox' | 'toggle' (machine-mode switch)
+        #   var   IntVar (entry) | None (button) | BooleanVar (checkbox) | StringVar (toggle)
         #   lo/hi int bounds for entry, None otherwise
         self._pend_items:   list  = []
         self._pend_idx:     int   = 0
@@ -946,6 +984,29 @@ class CoffeeCyclerApp:
         self.skip_dispense_cb.grid(row=2, column=0, columnspan=2, sticky="w")
         self._pend_labels[4] = self.skip_dispense_cb   # turns green when pendant-focused
 
+        # ── Machine-mode switch (2.2.x / 3.0) ────────────────────────────────
+        # Two tappable segments acting as one selector; the choice reorders the
+        # cycle ops (see CycleRunner). Pendant: Enter flips it in place.
+        mode_row = tk.Frame(grid_cfg, bg=self.PANEL)
+        mode_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.machine_lbl = tk.Label(mode_row, text="Machine", bg=self.PANEL,
+                                    fg=self.MUTED, font=("Helvetica", 11))
+        self.machine_lbl.pack(side="left")
+        self._pend_labels[5] = self.machine_lbl   # turns green when pendant-focused
+        seg = tk.Frame(mode_row, bg=self.BORDER)
+        seg.pack(side="left", padx=(16, 0))
+        def _mode_segment(text, mode):
+            return tk.Button(seg, text=text, bd=0, relief="flat", width=7,
+                             font=("Helvetica", 12, "bold"), cursor="hand2",
+                             highlightthickness=0, pady=6,
+                             disabledforeground=self.BORDER,
+                             command=lambda: self._set_machine_mode(mode))
+        self.machine_22_btn = _mode_segment("2.2.x", "2.2")
+        self.machine_30_btn = _mode_segment("3.0",   "3.0")
+        self.machine_22_btn.pack(side="left", padx=(1, 0), pady=1)
+        self.machine_30_btn.pack(side="left", padx=1,      pady=1)
+        self._style_machine_switch()
+
         # ── Pendant indicator ────────────────────────────────────────────────
         pend = self._panel(outer)
         ttk.Label(pend, text="NUMPAD PENDANT", style="Section.TLabel").pack(anchor="w",
@@ -1034,6 +1095,7 @@ class CoffeeCyclerApp:
     #   'entry'    ttk.Entry   IntVar  int   int   str
     #   'button'   ttk.Button  None    None  None  str
     #   'checkbox' Checkbutton BoolVar None  None  str
+    #   'toggle'   tk.Button   StrVar  None  None  str   (machine-mode 2.2/3.0 switch)
 
     # Keysym → method for keys that are ALWAYS pendant actions (never type a character).
     # Both KP_ variants (standard) and plain keysym variants (some Windows configs) included.
@@ -1065,6 +1127,7 @@ class CoffeeCyclerApp:
             ("entry",    self.ring_timeout_entry, self.ring_timeout_var,   30,  600, "Ring timeout (s)"),
             ("entry",    self.maint_entry,        self.maint_interval_var, 1,   999, "Maintenance interval"),
             ("checkbox", self.skip_dispense_cb,   self.skip_dispense_var,  None, None, "Skip dispense"),
+            ("toggle",   self.machine_22_btn,     self.machine_mode_var,   None, None, "Machine"),
             ("button",   self.start_btn,          None, None, None, "Start Cycle"),
             ("button",   self.stop_btn,           None, None, None, "Stop"),
             ("button",   self.reconnect_btn,      None, None, None, "Reconnect"),
@@ -1079,9 +1142,9 @@ class CoffeeCyclerApp:
                 # <Key> guard fires BEFORE the Entry class binding that inserts chars.
                 # It also catches char-based variants (e.g. 'slash' vs 'KP_Divide').
                 widget.bind("<Key>", self._pend_key_guard)
-            elif kind == "checkbox":
-                # Widget-level Enter runs the pendant handler BEFORE the Checkbutton
-                # class binding and breaks — otherwise Enter would double-toggle.
+            elif kind in ("checkbox", "toggle"):
+                # Widget-level Enter runs the pendant handler BEFORE the Checkbutton/
+                # Button class binding and breaks — otherwise Enter would double-toggle.
                 widget.bind("<KP_Enter>", self._pend_enter)
                 widget.bind("<Return>",   self._pend_enter)
             widget.bind("<FocusIn>", lambda _e, idx=i: self._on_widget_focus(idx))
@@ -1123,7 +1186,7 @@ class CoffeeCyclerApp:
         # handler fires BEFORE the Checkbutton/Button class binding (which would
         # toggle the widget independently and cause a double-action).
         for i, (kind, widget, *_) in enumerate(items):
-            if kind in ('checkbox', 'button'):
+            if kind in ('checkbox', 'button', 'toggle'):
                 widget.bind('<KP_Enter>', self._pend_enter)
                 widget.bind('<Return>',   self._pend_enter)
             widget.bind('<KP_Decimal>',  self._pend_down)
@@ -1194,6 +1257,10 @@ class CoffeeCyclerApp:
             checked = "checked" if (_var and _var.get()) else "unchecked"
             self._pend_focus_var.set(f">>  {label}  [{checked}]")
             self._pend_hint_var.set("Enter to toggle and advance")
+        elif kind == "toggle":
+            mode = "3.0" if (_var and _var.get() == "3.0") else "2.2.x"
+            self._pend_focus_var.set(f">>  {label}  [{mode}]")
+            self._pend_hint_var.set("Enter to switch machine mode")
 
     # -- key handlers ---------------------------------------------------------
 
@@ -1265,6 +1332,10 @@ class CoffeeCyclerApp:
             if var is not None: var.set(not var.get())
             self._pend_move(1)
             self._pend_update_indicator()
+
+        elif kind == "toggle":
+            # Flip in place (no advance) so the operator sees the selection land.
+            self._set_machine_mode("3.0" if var.get() == "2.2" else "2.2")
 
         return "break"
 
@@ -1392,13 +1463,15 @@ class CoffeeCyclerApp:
                 return
 
             skip_dispense = bool(self.skip_dispense_var.get())
+            machine       = self.machine_mode_var.get()
 
             if not self._show_prestart_dialog():
                 return
 
             for w in (self.cycles_entry, self.ring_min_entry,
                       self.ring_timeout_entry, self.maint_entry,
-                      self.skip_dispense_cb):
+                      self.skip_dispense_cb,
+                      self.machine_22_btn, self.machine_30_btn):
                 w.configure(state="disabled")
             self.start_btn.configure(state="disabled")
             self.reconnect_btn.configure(state="disabled")
@@ -1414,7 +1487,8 @@ class CoffeeCyclerApp:
                                  # check can't slip in between start and the first tick
             self.cycle_thread = threading.Thread(
                 target=self._run_cycles,
-                args=(n, ring_wait_min, ring_timeout, maint_interval, skip_dispense),
+                args=(n, ring_wait_min, ring_timeout, maint_interval, skip_dispense,
+                      machine),
                 daemon=True,
             )
             self.cycle_thread.start()
@@ -1489,6 +1563,52 @@ class CoffeeCyclerApp:
 
         self.root.wait_window(dlg)
         return result["ok"]
+
+    # =========================================================================
+    #  Machine-mode switch (2.2.x / 3.0)
+    # =========================================================================
+    @staticmethod
+    def _load_machine_mode() -> str:
+        """Restore the persisted machine mode; anything unexpected -> safe "2.2"."""
+        try:
+            with open(CONFIG_FILE) as fh:
+                if json.load(fh).get("machine_mode") == "3.0":
+                    return "3.0"
+        except Exception:
+            pass
+        return "2.2"
+
+    @staticmethod
+    def _save_machine_mode(mode: str):
+        cfg = {}
+        try:
+            with open(CONFIG_FILE) as fh:
+                cfg = json.load(fh)   # preserve the saved COM-port assignments
+        except Exception:
+            pass
+        cfg["machine_mode"] = mode
+        try:
+            with open(CONFIG_FILE, "w") as fh:
+                json.dump(cfg, fh, indent=2)
+        except Exception as e:
+            print(f"[config] machine mode save failed: {e}")
+
+    def _set_machine_mode(self, mode: str):
+        if str(self.machine_22_btn.cget("state")) == "disabled":
+            return   # locked while a run is active
+        self.machine_mode_var.set(mode)
+        self._style_machine_switch()
+        self._save_machine_mode(mode)
+        self._pend_update_indicator()
+
+    def _style_machine_switch(self):
+        sel = self.machine_mode_var.get()
+        for btn, mode in ((self.machine_22_btn, "2.2"), (self.machine_30_btn, "3.0")):
+            active = (mode == sel)
+            btn.configure(bg=self.ACCENT if active else self.PANEL,
+                          fg="#FFFFFF"   if active else self.MUTED,
+                          activebackground=self.ACCENT if active else self.PANEL,
+                          activeforeground="#FFFFFF"   if active else self.TEXT)
 
     def _show_ring_warning_dialog(self, color: str, detail: str) -> str:
         result = {"action": None, "dlg": None}
@@ -1653,11 +1773,12 @@ class CoffeeCyclerApp:
     #  Cycle execution
     # =========================================================================
     def _run_cycles(self, total: int, ring_wait_min: int, ring_timeout: int,
-                    maint_interval: int, skip_dispense: bool = False):
+                    maint_interval: int, skip_dispense: bool = False,
+                    machine: str = "2.2"):
         runner = CycleRunner(self.devices, ring_wait_min=ring_wait_min,
                              ring_timeout=ring_timeout,
                              ring_warning_cb=self._show_ring_warning_dialog,
-                             skip_dispense=skip_dispense)
+                             skip_dispense=skip_dispense, machine=machine)
         self.runner = runner
         try:
             for i in range(1, total + 1):
@@ -1771,8 +1892,10 @@ class CoffeeCyclerApp:
         self._clear_busy()       # run finished -> let the OTA launcher resume updates
         for w in (self.cycles_entry, self.ring_min_entry,
                   self.ring_timeout_entry, self.maint_entry,
-                  self.skip_dispense_cb):
+                  self.skip_dispense_cb,
+                  self.machine_22_btn, self.machine_30_btn):
             w.configure(state="normal")
+        self._style_machine_switch()   # restore segment colors after disable
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.reconnect_btn.configure(state="normal")

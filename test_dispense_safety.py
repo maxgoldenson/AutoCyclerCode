@@ -310,6 +310,65 @@ def test_skip_dispense_off_by_default_still_dispenses():
     print("PASS: skip dispense defaults off -> cycle still dispenses once")
 
 
+# --- machine-mode (2.2.x vs 3.0) op order -----------------------------------
+def _run_logged_cycle(machine: str):
+    """One full cycle with BOTH fake boards appending commands to one chronological
+    list, so cross-board op order can be asserted."""
+    events: list = []
+    front_model, disp_model = FrontBoard(), Board()
+    front = _make_device(lambda cmd: (events.append(cmd), front_model(cmd))[1])
+    disp  = _make_device(lambda cmd: (events.append(cmd), disp_model(cmd))[1])
+    dm    = types.SimpleNamespace(dispenser=disp, front=front)
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=5,
+                            ring_warning_cb=lambda _c, _d: "resume",
+                            machine=machine)
+    orig_sleep = cc._sleep
+    cc._sleep = lambda _secs, stop_flag: not stop_flag.is_set()
+    try:
+        ok, msg = runner.run_one(stop_flag=threading.Event(),
+                                 status_cb=lambda _n, _lbl: None)
+    finally:
+        cc._sleep = orig_sleep
+    return ok, msg, events
+
+
+def _first_index(events, prefix):
+    for i, e in enumerate(events):
+        if e.startswith(prefix):
+            return i
+    raise AssertionError(f"{prefix!r} never sent; log: {events}")
+
+
+def test_mode_22_order_error_dispense_door_cap():
+    ok, msg, ev = _run_logged_cycle("2.2")
+    assert ok, msg
+    order = [_first_index(ev, "GET COLOR ERROR"),
+             _first_index(ev, "SET ANGLE"),
+             _first_index(ev, f"SET SERVO {cc.SERVO_OPEN}"),
+             _first_index(ev, f"SET SERVO {cc.SERVO_REST}"),
+             _first_index(ev, "SET CAP ON")]
+    assert order == sorted(order), (order, ev)
+    print("PASS: 2.2.x order -- error check, dispense, door open/close, cap")
+
+
+def test_mode_30_order_dispense_door_error_cap():
+    ok, msg, ev = _run_logged_cycle("3.0")
+    assert ok, msg
+    order = [_first_index(ev, "SET ANGLE"),
+             _first_index(ev, f"SET SERVO {cc.SERVO_OPEN}"),
+             _first_index(ev, f"SET SERVO {cc.SERVO_REST}"),
+             _first_index(ev, "GET COLOR ERROR"),
+             _first_index(ev, "SET CAP ON")]
+    assert order == sorted(order), (order, ev)
+    print("PASS: 3.0 order -- dispense, door open/close, error check, cap")
+
+
+def test_machine_mode_defaults_to_22():
+    dm_probe = types.SimpleNamespace(dispenser=None, front=None)
+    assert cc.CycleRunner(dm_probe, 0, 5, None).machine == "2.2"
+    print("PASS: machine mode defaults to 2.2.x")
+
+
 def test_ring_timeout_stops_run_as_error():
     """No green flash within ring_timeout must halt the run as an ERROR. It used to
     'proceed anyway', silently dispensing cycle after cycle into a machine that never
@@ -412,6 +471,9 @@ if __name__ == "__main__":
         test_seq_monotonic_across_dispenses,
         test_skip_dispense_never_commands_dispenser,
         test_skip_dispense_off_by_default_still_dispenses,
+        test_mode_22_order_error_dispense_door_cap,
+        test_mode_30_order_dispense_door_error_cap,
+        test_machine_mode_defaults_to_22,
         test_ring_timeout_stops_run_as_error,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,
