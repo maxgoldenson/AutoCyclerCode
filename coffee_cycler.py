@@ -13,7 +13,7 @@ Cycle sequence per brew:
   5. Wait RING_WAIT_MIN_S, then poll Ring sensor for green completion flash
      * Green flash   -> proceed to next cycle
      * Warning color -> pause and prompt user (resume / reset / stop)
-     * Timeout       -> proceed to next cycle
+     * Timeout       -> assume the brew failed: halt the run as an error
 
 Numpad pendant controls (always active):
   8 / 2       navigate up / down between fields
@@ -51,7 +51,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-20 18:43"
+VERSION = "2026-07-27 10:15"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -569,7 +569,7 @@ class CycleRunner:
         Green  → return immediately so the dispenser can start the next cycle.
         Blue before green → always a warning (machine idle without having brewed).
         Orange / yellow   → warning.
-        Timeout           → proceed anyway.
+        Timeout           → no green seen: the caller halts the run as an error.
         """
         min_end     = trigger_time + self.ring_wait_min
         timeout_end = trigger_time + self.ring_timeout
@@ -738,7 +738,11 @@ class CycleRunner:
         if outcome == "green":
             status_cb(5, f"Machine ready -- {detail}")
         elif outcome == "timeout":
-            status_cb(5, "Ring timeout -- proceeding anyway")
+            # No green flash within the timeout: assume the brew never happened (or the
+            # machine faulted mid-brew). Proceeding here used to silently dispense cycle
+            # after cycle into a machine that wasn't brewing, so halt and alert instead.
+            status_cb(5, "Ring timeout -- no green flash, stopping")
+            return False, f"Ring timeout -- {detail}"
         elif outcome.startswith("warning:"):
             color  = outcome.split(":")[1]
             action = self.ring_warning_cb(color, detail)

@@ -310,6 +310,32 @@ def test_skip_dispense_off_by_default_still_dispenses():
     print("PASS: skip dispense defaults off -> cycle still dispenses once")
 
 
+def test_ring_timeout_stops_run_as_error():
+    """No green flash within ring_timeout must halt the run as an ERROR. It used to
+    'proceed anyway', silently dispensing cycle after cycle into a machine that never
+    brewed."""
+    front = _make_device(FrontBoard())
+    disp  = _make_device(Board())
+    dm    = types.SimpleNamespace(dispenser=disp, front=front)
+    # ring_timeout=0 -> the poll window is already over when the wait starts, so the
+    # outcome is "timeout" without burning real seconds.
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=0,
+                            ring_warning_cb=lambda _c, _d: "resume")
+    orig_sleep = cc._sleep
+    cc._sleep = lambda _secs, stop_flag: not stop_flag.is_set()
+    try:
+        ok, msg = runner.run_one(stop_flag=threading.Event(),
+                                 status_cb=lambda _n, _lbl: None)
+    finally:
+        cc._sleep = orig_sleep
+    assert not ok, msg
+    assert "Ring timeout" in msg, msg
+    # The GUI routes any failure message containing "Stopped" to the quiet user-stop
+    # path; a timeout must NOT contain it so it reaches _on_error (red status + ntfy).
+    assert "Stopped" not in msg, msg
+    print("PASS: ring timeout -> run halts as an error (no silent proceed)")
+
+
 def test_send_still_retries_idempotent_commands():
     dev = _make_device(lambda cmd: [])   # never answers
     resp = dev.send("GET COLOR RING", expect="RGB:", retries=2)
@@ -386,6 +412,7 @@ if __name__ == "__main__":
         test_seq_monotonic_across_dispenses,
         test_skip_dispense_never_commands_dispenser,
         test_skip_dispense_off_by_default_still_dispenses,
+        test_ring_timeout_stops_run_as_error,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,
         test_notifier_disabled_without_topic,
