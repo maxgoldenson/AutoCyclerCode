@@ -35,17 +35,31 @@ clean run end / user stop (`_on_finished` → `_set_idle_gate`). NOT opened on `
 (the board may be in an unknown state).
 
 **Cycle sequence** (identical in both machine modes):
-GET COLOR ERROR (abort if red) → SET ANGLE 360 (~19 g) → servo OPEN → 3 s → REST
+watch error light 1 flash period → SET ANGLE 360 (~19 g) → servo OPEN → 3 s → REST
 → wait blue ring → CAP ON pulse → poll for green flash.
 - Green-flash timeout (`ring_timeout`, default 120 s) halts the run as an ERROR
   (red status + ntfy alert); it no longer proceeds to the next cycle.
 
+**ERRORS COME FROM THE ERROR LIGHT, NOT THE RING.** The error light is a dead marker —
+dark unless something is wrong, flashing ~1 Hz in any fault color (blue = water error).
+`CycleRunner._error_light_worker` is a daemon thread that samples it for the WHOLE cycle
+(including the dispense, which blocks on the *other* serial port) and halts the run the
+moment it lights. Detection is a **saturation** test (`_error_light_lit`), because the
+firmware's `readRGB()` divides each channel by the clear channel — brightness is already
+normalized out, so an unlit indicator reads near-neutral and any lit color reads as a
+strong cast. That catches every fault color without enumerating them. Tune
+`ERROR_LIGHT_SAT_MIN` from the `[errlight]` log lines if the field disagrees.
+- Never conclude "clear" from one sample — the light blinks. The pre-flight step waits
+  `ERROR_LIGHT_CLEAR_S` (> one full period) and asks the watcher.
+- An unreadable sensor (`ERROR_LIGHT_MAX_FAILS` consecutive bad reads) halts the run:
+  it's the only error detector, so running blind is worse than stopping.
+- Ring **blue is ignored in both modes** — the machine reuses it for "time to go" and for
+  a water error. Ring orange/yellow still raise the operator prompt as a second net.
+
 **Machine mode (2.2.x / 3.0):** segmented switch in the CONFIGURATION panel, pendant item
-5 (kind `toggle`), persisted as `machine_mode`. It does **not** reorder the cycle — the
-only difference is `CycleRunner.ignore_blue_ring`: on 3.0 a blue ring while waiting for
-green never warns, because 3.0 uses the same blue for the harmless "time to go" ring and
-the water-error ring and the fixture can't yet tell them apart. Stopgap until blue is
-split by timing. Details + the shelved op-reorder: `docs/machine_mode_3_0.md`.
+5 (kind `toggle`), persisted as `machine_mode`. Records which machine is on the fixture;
+**both modes currently behave identically** — it's the hook for the 3.0 ring-timing work.
+Details + the shelved op-reorder: `docs/machine_mode_3_0.md`.
 
 **Config persistence:** `autocycler_config.json` in project root saves discovered COM port
 assignments plus app-level keys (`machine_mode`); `DeviceManager._save_config` re-reads

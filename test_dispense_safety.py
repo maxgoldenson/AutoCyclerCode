@@ -66,6 +66,10 @@ import coffee_cycler as cc  # noqa: E402
 cc.DISPENSE_ACK_TIMEOUT_S = 0.25
 cc.STATUS_PROBE_TIMEOUT_S = 0.1
 cc.STATUS_PROBE_BUDGET_S  = 0.3
+# The error-light watcher runs on its own thread for the whole cycle; sample it fast so
+# thread-timing tests resolve in milliseconds instead of flash periods.
+cc.ERROR_LIGHT_POLL_S     = 0.01
+cc.ERROR_LIGHT_CLEAR_S    = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +328,16 @@ def _run_logged_cycle(machine: str):
     list, so cross-board op order can be asserted."""
     events: list = []
     front_model, disp_model = FrontBoard(), Board()
-    front = _make_device(lambda cmd: (events.append(cmd), front_model(cmd))[1])
-    disp  = _make_device(lambda cmd: (events.append(cmd), disp_model(cmd))[1])
+
+    def _log(cmd):
+        # Drop the error-light watcher's polls: it samples on its own thread for the
+        # whole cycle, so how many land between two cycle ops is timing-dependent and
+        # says nothing about op ORDER, which is what these tests pin.
+        if not cmd.startswith("GET COLOR ERROR"):
+            events.append(cmd)
+
+    front = _make_device(lambda cmd: (_log(cmd), front_model(cmd))[1])
+    disp  = _make_device(lambda cmd: (_log(cmd), disp_model(cmd))[1])
     dm    = types.SimpleNamespace(dispenser=disp, front=front)
     runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=5,
                             ring_warning_cb=lambda _c, _d: "resume",
@@ -347,16 +359,15 @@ def _first_index(events, prefix):
     raise AssertionError(f"{prefix!r} never sent; log: {events}")
 
 
-def test_mode_22_order_error_dispense_door_cap():
+def test_mode_22_order_dispense_door_cap():
     ok, msg, ev = _run_logged_cycle("2.2")
     assert ok, msg
-    order = [_first_index(ev, "GET COLOR ERROR"),
-             _first_index(ev, "SET ANGLE"),
+    order = [_first_index(ev, "SET ANGLE"),
              _first_index(ev, f"SET SERVO {cc.SERVO_OPEN}"),
              _first_index(ev, f"SET SERVO {cc.SERVO_REST}"),
              _first_index(ev, "SET CAP ON")]
     assert order == sorted(order), (order, ev)
-    print("PASS: 2.2.x order -- error check, dispense, door open/close, cap")
+    print("PASS: 2.2.x order -- dispense, door open/close, cap")
 
 
 def test_mode_30_runs_the_same_op_order_as_22():
@@ -370,49 +381,129 @@ def test_mode_30_runs_the_same_op_order_as_22():
 
 def test_machine_mode_defaults_to_22():
     dm_probe = types.SimpleNamespace(dispenser=None, front=None)
-    runner = cc.CycleRunner(dm_probe, 0, 5, None)
-    assert runner.machine == "2.2"
-    assert runner.ignore_blue_ring is False
-    print("PASS: machine mode defaults to 2.2.x (blue ring still warns)")
+    assert cc.CycleRunner(dm_probe, 0, 5, None).machine == "2.2"
+    print("PASS: machine mode defaults to 2.2.x")
 
 
-# --- 3.0 ignores blue rings -------------------------------------------------
-def _blue_ring_outcome(machine: str):
-    """_wait_for_ring against a ring that reads BLUE forever (never green)."""
-    front = _make_device(lambda _cmd: [b"RGB:10,10,220\n"])
+# --- the ring no longer decides errors --------------------------------------
+def _ring_outcome(machine: str, reads: list, ring_timeout: int = 1):
+    """Drive _wait_for_ring against a scripted sequence of ring reads (the last one
+    repeats once the script runs out)."""
+    q = list(reads)
+    front = _make_device(lambda _cmd: [q.pop(0) if len(q) > 1 else q[0]])
     dm    = types.SimpleNamespace(dispenser=None, front=front)
-    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=1,
-                            ring_warning_cb=lambda _c, _d: "resume",
-                            machine=machine)
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=ring_timeout,
+                            ring_warning_cb=lambda _c, _d: "resume", machine=machine)
     return runner._wait_for_ring(time.time(), threading.Event(),
                                  lambda _n, _lbl: None)
 
 
-def test_mode_22_blue_ring_still_warns():
-    outcome, detail = _blue_ring_outcome("2.2")
-    assert outcome == "warning:blue", (outcome, detail)
-    print("PASS: 2.2.x -- blue before green still raises the ring warning")
+def test_blue_ring_never_warns_in_either_mode():
+    """Blue is ambiguous on the machine ("time to go" vs water error), so it carries no
+    failure information in EITHER mode. A brew that never happens still halts the run,
+    via the ring timeout -- and a real fault trips the error light instead."""
+    for machine in ("2.2", "3.0"):
+        outcome, detail = _ring_outcome(machine, [b"RGB:10,10,220\n"])
+        assert outcome == "timeout", (machine, outcome, detail)
+    print("PASS: blue ring never warns, in either machine mode")
 
 
-def test_mode_30_blue_ring_ignored():
-    """On 3.0 a blue ring is ambiguous, so it must not raise a warning. A brew that
-    never happens still halts the run, via the ring timeout."""
-    outcome, detail = _blue_ring_outcome("3.0")
-    assert outcome == "timeout", (outcome, detail)
-    print("PASS: 3.0 -- blue ring ignored, only the timeout halts the run")
-
-
-def test_mode_30_blue_ring_does_not_block_green():
+def test_blue_ring_does_not_block_green():
     """Ignoring blue must not swallow the green flash that follows it."""
-    reads = [b"RGB:10,10,220\n", b"RGB:10,10,220\n", b"RGB:10,220,10\n"]
-    front = _make_device(lambda _cmd: [reads.pop(0)] if reads else [b"RGB:10,220,10\n"])
-    dm    = types.SimpleNamespace(dispenser=None, front=front)
-    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=5,
-                            ring_warning_cb=lambda _c, _d: "resume", machine="3.0")
-    outcome, detail = runner._wait_for_ring(time.time(), threading.Event(),
-                                            lambda _n, _lbl: None)
+    outcome, detail = _ring_outcome(
+        "2.2", [b"RGB:10,10,220\n", b"RGB:10,10,220\n", b"RGB:10,220,10\n"],
+        ring_timeout=5)
     assert outcome == "green", (outcome, detail)
-    print("PASS: 3.0 -- green after blue is still detected")
+    print("PASS: green after blue is still detected")
+
+
+def test_orange_ring_still_prompts_the_operator():
+    """The orange/yellow prompt stays as a second net alongside the error light."""
+    outcome, detail = _ring_outcome("3.0", [b"RGB:220,60,10\n"], ring_timeout=5)
+    assert outcome == "warning:orange", (outcome, detail)
+    print("PASS: orange ring still raises the operator prompt")
+
+
+# --- error light: the actual error detector ---------------------------------
+def test_error_light_saturation_detects_every_color():
+    """The board returns chromaticity (each channel / clear), so 'lit' is a saturation
+    test -- it must catch the blue water error, not just the legacy red rule."""
+    lit = cc.CycleRunner._error_light_lit
+    assert lit(10, 10, 220),  "blue water error must count as lit"
+    assert lit(220, 20, 20),  "red must count as lit"
+    assert lit(200, 180, 20), "yellow must count as lit"
+    assert not lit(85, 85, 85), "neutral (unlit under the fixture LED) must be clear"
+    assert not lit(90, 85, 80), "near-neutral sensor noise must not trip it"
+    print("PASS: error light detects any lit color, ignores a neutral read")
+
+
+class ErrorLightFront(FrontBoard):
+    """Front board whose ERROR sensor goes lit (blue) after `clear_reads` clean reads,
+    modelling a water error appearing partway through a cycle."""
+    def __init__(self, clear_reads=1):
+        super().__init__()
+        self.clear_reads = clear_reads
+        self.error_reads = 0
+
+    def __call__(self, cmd):
+        if cmd.startswith("GET COLOR ERROR"):
+            self.error_reads += 1
+            if self.error_reads > self.clear_reads:
+                return [b"RGB:10,10,220\n"]     # blue = water error
+            return [b"RGB:85,85,85\n"]          # neutral = light off
+        return super().__call__(cmd)
+
+
+def _run_cycle_with_front(front_model, ring_timeout=5):
+    front = _make_device(front_model)
+    disp  = _make_device(Board())
+    dm    = types.SimpleNamespace(dispenser=disp, front=front)
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=ring_timeout,
+                            ring_warning_cb=lambda _c, _d: "resume")
+    orig_sleep = cc._sleep
+    # Keep _sleep real-but-short: the watcher is a thread, so collapsing every wait to
+    # zero would race the cycle past it before it ever samples.
+    cc._sleep = lambda secs, stop_flag: not stop_flag.wait(min(secs, 0.05))
+    try:
+        return runner.run_one(stop_flag=threading.Event(),
+                              status_cb=lambda _n, _lbl: None)
+    finally:
+        cc._sleep = orig_sleep
+
+
+def test_error_light_halts_the_run():
+    ok, msg = _run_cycle_with_front(ErrorLightFront(clear_reads=1))
+    assert not ok, msg
+    assert "Error light ON" in msg, msg
+    # Must NOT contain "Stopped": that routes to the quiet user-stop path in the GUI
+    # and would hide the fault instead of raising a red status + ntfy alert.
+    assert "Stopped" not in msg, msg
+    print("PASS: error light lighting mid-cycle halts the run as an error")
+
+
+def test_error_light_clear_lets_the_cycle_finish():
+    ok, msg = _run_cycle_with_front(FrontBoard())
+    assert ok, msg
+    print("PASS: a dark error light leaves the cycle untouched")
+
+
+def test_unreadable_error_light_halts_the_run():
+    """The error light is now the ONLY error detector, so losing sight of it has to stop
+    the run rather than let it continue blind."""
+    class BlindFront(FrontBoard):
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                return [b"ERROR:zero clear channel\n"]
+            return super().__call__(cmd)
+    saved = cc.ERROR_LIGHT_MAX_FAILS
+    cc.ERROR_LIGHT_MAX_FAILS = 3
+    try:
+        ok, msg = _run_cycle_with_front(BlindFront())
+    finally:
+        cc.ERROR_LIGHT_MAX_FAILS = saved
+    assert not ok, msg
+    assert "unreadable" in msg, msg
+    print("PASS: an unreadable error light halts the run instead of running blind")
 
 
 def test_ring_timeout_stops_run_as_error():
@@ -517,12 +608,16 @@ if __name__ == "__main__":
         test_seq_monotonic_across_dispenses,
         test_skip_dispense_never_commands_dispenser,
         test_skip_dispense_off_by_default_still_dispenses,
-        test_mode_22_order_error_dispense_door_cap,
+        test_mode_22_order_dispense_door_cap,
         test_mode_30_runs_the_same_op_order_as_22,
         test_machine_mode_defaults_to_22,
-        test_mode_22_blue_ring_still_warns,
-        test_mode_30_blue_ring_ignored,
-        test_mode_30_blue_ring_does_not_block_green,
+        test_blue_ring_never_warns_in_either_mode,
+        test_blue_ring_does_not_block_green,
+        test_orange_ring_still_prompts_the_operator,
+        test_error_light_saturation_detects_every_color,
+        test_error_light_halts_the_run,
+        test_error_light_clear_lets_the_cycle_finish,
+        test_unreadable_error_light_halts_the_run,
         test_ring_timeout_stops_run_as_error,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,

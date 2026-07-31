@@ -6,18 +6,24 @@ Devices are auto-discovered by their WHO AM I response and the
 COM port assignments are persisted to autocycler_config.json.
 
 Cycle sequence per brew (identical for both machine modes):
-  1. GET COLOR ERROR  -- abort if error light is red/orange/yellow
+  1. Watch the error light for one flash period -- abort if it is lit
   2. SET ANGLE 360    -- dispense ~19 g
   3. Servo OPEN -> 3 s -> CLOSE
   4. Wait for blue (ready), SET CAP ON -> pulse -> OFF  -- trigger machine brew
   5. Wait RING_WAIT_MIN_S, then poll Ring sensor for green completion flash
-     * Green flash   -> proceed to next cycle
-     * Warning color -> pause and prompt user (resume / reset / stop)
-     * Timeout       -> assume the brew failed: halt the run as an error
+     * Green flash     -> proceed to next cycle
+     * Orange / yellow -> pause and prompt user (resume / reset / stop)
+     * Timeout         -> assume the brew failed: halt the run as an error
 
-The Machine switch (2.2.x / 3.0) in the CONFIGURATION panel selects the machine
-under test. Both modes run the op order above; the only difference is that 3.0
-never raises a BLUE ring warning -- see CycleRunner.ignore_blue_ring.
+ERRORS COME FROM THE ERROR LIGHT, NOT THE RING. A background watcher samples the
+error light for the whole cycle and halts the run the moment it lights in ANY
+color; the ring only reports the green brew-complete flash (plus the legacy
+orange/yellow operator prompt). Ring BLUE is ignored -- the machine drives it
+both for "time to go" and for a water error. See the ERROR_LIGHT_* notes.
+
+The Machine switch (2.2.x / 3.0) in the CONFIGURATION panel records which machine
+is on the fixture. Both modes currently behave identically; it is the hook for
+the 3.0 ring-timing work.
 
 Numpad pendant controls (always active):
   8 / 2       navigate up / down between fields
@@ -57,7 +63,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 17:15"
+VERSION = "2026-07-31 17:36"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -114,10 +120,26 @@ ID_FRONT     = "FRONT_ASSEMBLY"
 SERVO_REST = 95
 SERVO_OPEN = 135
 
-# -- Error sensor color thresholds --------------------------------------------
-COLOR_ERR_MIN_R    = 160
-COLOR_ERR_R_OVER_G = 2.5
-COLOR_ERR_R_OVER_B = 3.0
+# -- Error light ---------------------------------------------------------------
+# The machine's error light is a DEAD MARKER: it is dark unless something is wrong, and
+# when something IS wrong it flashes at ~1 Hz in whatever color the fault maps to (blue
+# for a water error, red/amber for others). That makes it a far better error signal than
+# the ring, which reuses colors across healthy and faulted states.
+#
+# Detection is a SATURATION test, not a brightness or per-color one. The firmware's
+# readRGB() divides every channel by the CLEAR channel, so brightness is already divided
+# out and what comes back is chromaticity: an unlit indicator under the fixture's
+# illumination LED reads near-neutral (r ~ g ~ b) and ANY lit color reads as a strong
+# color cast. Testing max-minus-min therefore catches every error color without having to
+# enumerate them -- which is the whole point, since the light means "some error".
+#
+# Because it FLASHES, one sample can land in the dark half of the cycle: never conclude
+# "clear" from a single read. ERROR_LIGHT_CLEAR_S covers more than a full flash period.
+ERROR_LIGHT_SAT_MIN   = 60    # max(r,g,b) - min(r,g,b) at/above this = lit
+ERROR_LIGHT_POLL_S    = 0.2   # sample interval — several samples per flash period
+ERROR_LIGHT_CLEAR_S   = 1.6   # pre-flight observation window (> one full 1 Hz period)
+ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before halting:
+                              # a blind error detector is worse than no run at all
 
 # -- Ring sensor color thresholds ---------------------------------------------
 RING_GREEN_MIN_G          = 40
@@ -520,22 +542,16 @@ class CycleRunner:
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
         self.skip_dispense   = skip_dispense
-        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. Both modes
-        # run the SAME op order; 3.0 only changes how a blue ring is treated.
+        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. It records
+        # WHICH machine is on the fixture; both modes currently run identically. It is
+        # the hook for the 3.0 ring-timing work, so keep it wired through.
         self.machine         = machine
         self._green_seen  = False
         self._cycle_count = 0
         self._green_times: list = []  # wall-clock timestamps of each green flash
-
-    @property
-    def ignore_blue_ring(self) -> bool:
-        """3.0 only: the machine drives the SAME blue ring for two different states --
-        the "time to go" ready ring and the water-error ring -- and the fixture cannot
-        tell them apart yet. Treating that read as a failure would stop good runs on a
-        ring that means the machine is fine, so 3.0 never warns on blue and keeps
-        polling for green. A brew that genuinely never happens still halts the run via
-        the ring timeout. Remove this once blue is split by timing / classification."""
-        return self.machine == "3.0"
+        # Set by the error-light watcher thread; read by every wait loop in the cycle.
+        self._error_flag   = threading.Event()
+        self._error_detail = ""
 
     @property
     def mean_cycle_s(self) -> float:
@@ -548,11 +564,14 @@ class CycleRunner:
 
     def _wait_for_blue(self, stop_flag, status_cb, timeout: int = 120) -> bool:
         """Poll ring until blue (machine idle/ready) is seen or timeout.
-        Returns False only if stop was requested; timeout proceeds silently."""
+        Returns False if stop was requested or the error light tripped; timeout proceeds
+        silently. Blue is unreliable as a FAILURE signal but is still the machine's
+        ready cue, so it stays in use here — this wait can only cost time, and the
+        timeout falls through to the brew trigger either way."""
         f = self.dev.front
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if stop_flag.is_set():
+            if stop_flag.is_set() or self._error_flag.is_set():
                 return False
             status_cb(4, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
             resp = f.send("GET COLOR RING", expect="RGB:")
@@ -568,8 +587,73 @@ class CycleRunner:
         print(f"[blue-wait] no blue after {timeout}s, proceeding")
         return True
 
-    def _is_color_error(self, r, g, b) -> bool:
-        return r >= COLOR_ERR_MIN_R and r > g * COLOR_ERR_R_OVER_G and r > b * COLOR_ERR_R_OVER_B
+    # -- Error-light watch ----------------------------------------------------
+    # A background reader samples the error light for the WHOLE cycle rather than once
+    # up front. Two reasons it has to be a thread and not an inline poll: the light
+    # flashes, so a fault has to be sampled for rather than glanced at; and the longest
+    # blocking op in a cycle is the dispense, which runs on the OTHER serial port, so a
+    # thread is the only way to keep watching through it. SerialDevice serializes access
+    # per port, so sharing the front board with the cycle worker is safe.
+
+    @staticmethod
+    def _error_light_lit(r, g, b) -> bool:
+        """True when the error light is lit in ANY color -- see the ERROR_LIGHT_* notes:
+        the board hands back chromaticity, so saturation (not brightness, not a per-color
+        rule) is what separates a dark indicator from a lit one."""
+        return (max(r, g, b) - min(r, g, b)) >= ERROR_LIGHT_SAT_MIN
+
+    def _flag_error(self, detail: str):
+        print(f"[errlight] {detail}")
+        self._error_detail = detail
+        self._error_flag.set()
+
+    def _error_pending(self) -> Optional[tuple[bool, str]]:
+        """The (ok, msg) tuple the cycle must exit with, or None to carry on."""
+        if not self._error_flag.is_set():
+            return None
+        return False, self._error_detail
+
+    def _abort_reason(self, default: str = "Stopped") -> tuple[bool, str]:
+        """Exit tuple for a wait that bailed out. A tripped error light outranks a plain
+        stop: "Stopped" routes to the quiet user-stop path, which would bury the fault."""
+        return self._error_pending() or (False, default)
+
+    def _error_light_worker(self, stop_flag):
+        f     = self.dev.front
+        fails = 0
+        while not stop_flag.is_set() and not self._error_flag.is_set():
+            rgb = None
+            try:
+                resp = f.send("GET COLOR ERROR", expect="RGB:")
+                if resp.startswith("RGB:"):
+                    rgb = tuple(int(x) for x in resp[4:].split(","))
+            except ValueError:
+                rgb = None            # malformed RGB payload — treat as a failed read
+            except Exception as e:
+                print(f"[errlight] read failed: {e}")
+            if rgb is None:
+                fails += 1
+                if fails >= ERROR_LIGHT_MAX_FAILS:
+                    # Can't see the light at all. Since it is the only error detector,
+                    # running blind is worse than stopping.
+                    self._flag_error(f"Error light unreadable -- {fails} bad reads")
+                    return
+            else:
+                fails = 0
+                r, g, b = rgb
+                if self._error_light_lit(r, g, b):
+                    self._flag_error(f"Error light ON -- R={r} G={g} B={b} "
+                                     f"(sat {max(rgb) - min(rgb)})")
+                    return
+            stop_flag.wait(ERROR_LIGHT_POLL_S)
+
+    def _start_error_watch(self, stop_flag) -> threading.Thread:
+        self._error_flag.clear()
+        self._error_detail = ""
+        t = threading.Thread(target=self._error_light_worker, args=(stop_flag,),
+                             daemon=True)
+        t.start()
+        return t
 
     def _classify_ring_color(self, r, g, b) -> Optional[str]:
         if g >= RING_GREEN_MIN_G and g > r * RING_GREEN_G_OVER_R and g > b * RING_GREEN_G_OVER_B:
@@ -587,11 +671,12 @@ class CycleRunner:
         """
         Poll for the green brew-complete flash.
         Green  → return immediately so the dispenser can start the next cycle.
-        Blue before green → a warning on 2.2.x (machine idle without having brewed);
-                            ignored on 3.0, where blue is ambiguous — see
-                            ignore_blue_ring.
-        Orange / yellow   → warning.
-        Timeout           → no green seen: the caller halts the run as an error.
+        Blue   → ignored. The ring reuses blue for the harmless "time to go" state and
+                 for a water error, so it can't tell a healthy machine from a faulted
+                 one. Errors are the error light's job now (see the ERROR_LIGHT_* notes).
+        Orange / yellow → warning: still prompts the operator, as a second net.
+        Error light     → halt immediately, whatever the ring says.
+        Timeout         → no green seen: the caller halts the run as an error.
         """
         min_end     = trigger_time + self.ring_wait_min
         timeout_end = trigger_time + self.ring_timeout
@@ -599,11 +684,13 @@ class CycleRunner:
 
         while time.time() < min_end:
             if stop_flag.is_set(): return "stopped", "Stopped"
+            if self._error_flag.is_set(): return "error", self._error_detail
             status_cb(5, f"Waiting minimum -- {int(timeout_end - time.time())}s remaining")
             time.sleep(0.1)
 
         while time.time() < timeout_end:
             if stop_flag.is_set(): return "stopped", "Stopped"
+            if self._error_flag.is_set(): return "error", self._error_detail
             status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
 
             resp = f.send("GET COLOR RING", expect="RGB:")
@@ -624,13 +711,9 @@ class CycleRunner:
                 return "green", f"R={r} G={g} B={b}"
 
             if color == "blue":
-                if self.ignore_blue_ring:
-                    # 3.0: blue can be the harmless "time to go" ring, so it is not
-                    # evidence the machine failed to brew. Keep polling for green.
-                    print("[ring]   blue ignored (machine 3.0)")
-                    continue
-                # 2.2.x: blue before green always means the machine didn't brew
-                return "warning:blue", f"Blue ring before green (R={r} G={g} B={b})"
+                # Ambiguous by design ("time to go" vs water error) -- carries no
+                # information about whether the brew failed, so keep polling for green.
+                continue
 
             if color in ("orange", "yellow"):
                 return f"warning:{color}", f"{color.title()} ring (R={r} G={g} B={b})"
@@ -681,9 +764,15 @@ class CycleRunner:
         is closed and the brew trigger is released before returning. Leaving the
         gate open or CAP asserted is an overflow / continuous-trigger hazard.
         """
+        watch_stop = threading.Event()
+        watcher    = self._start_error_watch(watch_stop)
         try:
             return self._run_one(stop_flag, status_cb)
         finally:
+            # Retire the watcher BEFORE the safe-hardware commands: it shares the front
+            # board's lock, and a poll in flight would just delay closing the gate.
+            watch_stop.set()
+            watcher.join(timeout=CMD_TIMEOUT)
             self._safe_hardware()
 
     # -- Reorderable cycle operations. Each returns None to continue the cycle, or
@@ -691,23 +780,18 @@ class CycleRunner:
     #    assigned by the mode's op order so the progress display always ascends.
 
     def _check_error_light(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
-        f = self.dev.front
-        status_cb(num, "Checking error light...")
-        t0   = time.time()
-        resp = f.send("GET COLOR ERROR", expect="RGB:")
-        print(f"[serial] GET COLOR ERROR -> {resp!r}")
-        elapsed = time.time() - t0
-        if not resp.startswith("RGB:"):
-            return False, f"Color check failed: {resp or '(no response)'}"
-        try:
-            r, g, b = (int(x) for x in resp[4:].split(","))
-        except ValueError:
-            return False, f"Bad RGB response: {resp}"
-        if self._is_color_error(r, g, b):
-            return False, f"Error light on -- aborting (R={r} G={g} B={b})"
-        if not self._step(num, f"Error light OK  (R={r} G={g} B={b})", status_cb,
-                          stop_flag, elapsed, hold=2.0):
-            return False, "Stopped"
+        """Pre-flight gate: hold here for one full flash period and let the watcher
+        decide. The light blinks at ~1 Hz, so a single read proves nothing -- the old
+        one-shot check could pass simply by sampling during a dark half-cycle. Watching
+        instead of reading also keeps this the only place that talks to the sensor."""
+        if not self._step(num, "Watching error light...", status_cb, stop_flag,
+                          hold=ERROR_LIGHT_CLEAR_S):
+            return self._abort_reason()
+        err = self._error_pending()
+        if err:
+            return err
+        if not self._step(num, "Error light clear", status_cb, stop_flag, hold=0.5):
+            return self._abort_reason()
         return None
 
     def _dispense_step(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
@@ -716,7 +800,7 @@ class CycleRunner:
             print(f"[cycle] step {num}: dispense SKIPPED (skip dispense enabled)")
             status_cb(num, "Dispense skipped")
             if not _sleep(1.0, stop_flag):
-                return False, "Stopped"
+                return self._abort_reason()
             return None
         status_cb(num, "Dispensing ~19 g...")
         t0 = time.time()
@@ -736,7 +820,7 @@ class CycleRunner:
                # so later cycles would dispense nothing. Stop with a clear message.
             return False, f"Dispense failed -- {detail}"
         if not self._step(num, step_label, status_cb, stop_flag, elapsed, hold=5.0):
-            return False, "Stopped"
+            return self._abort_reason()
         return None
 
     def _door_cycle(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
@@ -744,7 +828,7 @@ class CycleRunner:
         status_cb(num, "Opening gate...")
         resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
-        if not _sleep(3.0, stop_flag): return False, "Stopped"
+        if not _sleep(3.0, stop_flag): return self._abort_reason()
         status_cb(num, "Closing gate...")
         resp_close = f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
@@ -758,35 +842,42 @@ class CycleRunner:
         f.send("SET CAP OFF", expect="CAP:")
 
         # Both machine modes run this order: pre-flight error check, dispense, door
-        # cycle. 3.0 deliberately does NOT reorder the ops -- the only 3.0 difference is
-        # that a blue ring never raises a warning (see ignore_blue_ring). The ops stay
-        # extracted so a confirmed 3.0 order can be swapped in here later.
+        # cycle. 3.0 deliberately does NOT reorder the ops. They stay extracted so a
+        # confirmed 3.0 order can be swapped in here later.
         order = (self._check_error_light, self._dispense_step, self._door_cycle)
         for num, op in enumerate(order, start=1):
             early_exit = op(num, stop_flag, status_cb)
             if early_exit is not None:
                 return early_exit
+            # Re-checked between ops as well as inside the waits, so a fault that lands
+            # mid-op stops the NEXT physical action rather than after the whole cycle.
+            err = self._error_pending()
+            if err:
+                return err
 
         # Gate settle — 1 s gap, then poll until machine shows blue (idle/ready).
         # CAP stays high-impedance throughout.
-        if not _sleep(1.0, stop_flag): return False, "Stopped"
-        if not self._wait_for_blue(stop_flag, status_cb): return False, "Stopped"
+        if not _sleep(1.0, stop_flag): return self._abort_reason()
+        if not self._wait_for_blue(stop_flag, status_cb): return self._abort_reason()
 
         resp_cap = f.send("SET CAP ON", expect="CAP:")
         trigger_time = time.time()
         print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
         if not _sleep(CAP_PULSE_S, stop_flag):
             f.send("SET CAP OFF", expect="CAP:")
-            return False, "Stopped"
+            return self._abort_reason()
         resp_cap = f.send("SET CAP OFF", expect="CAP:")
         print(f"[serial] SET CAP OFF -> {resp_cap!r}")
         if not self._step(4, "Brew triggered", status_cb, stop_flag,
                           elapsed=CAP_PULSE_S, hold=1.5):
-            return False, "Stopped"
+            return self._abort_reason()
 
         outcome, detail = self._wait_for_ring(trigger_time, stop_flag, status_cb)
         if outcome == "stopped":
             return False, "Stopped"
+        if outcome == "error":
+            status_cb(5, f"Error light -- {detail}")
+            return False, detail
         if outcome == "green":
             status_cb(5, f"Machine ready -- {detail}")
         elif outcome == "timeout":
@@ -1019,11 +1110,6 @@ class CoffeeCyclerApp:
                           fg="#FFFFFF"   if active else self.MUTED,
                           activebackground=self.ACCENT if active else self.PANEL,
                           activeforeground="#FFFFFF"   if active else self.TEXT)
-        # 3.0 suppresses blue-ring warnings, which is invisible until a blue ring shows
-        # up mid-run. Say so on screen so nobody debugs a "missing" warning later.
-        self.machine_note.configure(
-            text=("blue ring warnings ignored" if sel == "3.0" else ""),
-            fg=self.WARNING)
 
     # -------------------------------------------------------------------------
     #  Window / styles
@@ -1206,9 +1292,8 @@ class CoffeeCyclerApp:
         self.machine_30_btn = _mode_segment("3.0",   "3.0")
         self.machine_22_btn.pack(side="left", padx=(1, 0), pady=1)
         self.machine_30_btn.pack(side="left", padx=1,      pady=1)
-        self.machine_note = tk.Label(mode_row, text="", bg=self.PANEL, fg=self.WARNING,
-                                     font=("Helvetica", 11))
-        self.machine_note.pack(side="left", padx=(16, 0))
+        # Records which machine is on the fixture. Both modes run the same cycle today —
+        # this is the hook for the 3.0 ring-timing work, so it stays wired end to end.
         self._style_machine_switch()
 
         # ── Pendant indicator ────────────────────────────────────────────────
@@ -1788,10 +1873,11 @@ class CoffeeCyclerApp:
     def _show_ring_warning_dialog(self, color: str, detail: str) -> str:
         result = {"action": None, "dlg": None}
         ready  = threading.Event()
+        # Blue is deliberately absent: it never reaches here any more (ambiguous ring,
+        # errors come from the error light instead).
         warning_msg = {
             "orange": "The machine may still be in a brew cycle or draining.",
             "yellow": "The machine may be in a warm-up or error state.",
-            "blue":   "The machine may be in a standby or fault state.",
         }.get(color, "An unexpected ring color was detected.")
 
         self.notifier.notify(
