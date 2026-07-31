@@ -662,6 +662,80 @@ def test_brew_is_only_triggered_from_a_running_cycle():
     print("PASS: the brew button is pressed from exactly one in-run code path")
 
 
+# --- blue bleed from the ring onto the error sensor --------------------------
+class BleedFront(FrontBoard):
+    """Models the reported crosstalk: once the gate closes, the machine shows its blue
+    "time to go" RING and that blue bleeds onto the ERROR sensor sitting beside it. The
+    bleed stops once the brew is triggered. `bleed_rgb` lets a test swap in a different
+    color to prove only BLUE is suppressed."""
+    def __init__(self, bleed_rgb=b"94,86,255"):
+        super().__init__()
+        self.bleed_rgb  = bleed_rgb
+        self.door_shut  = False
+        self.bleed_reads = 0          # proves the window was actually sampled
+
+    def __call__(self, cmd):
+        if cmd.startswith(f"SET SERVO {cc.SERVO_REST}"):
+            self.door_shut = True
+        if cmd.startswith("GET COLOR ERROR"):
+            if self.door_shut and not self.cap_pulses:
+                self.bleed_reads += 1
+                return [b"RGB:ERROR:" + self.bleed_rgb + b"\n"]
+            return [b"RGB:ERROR:85,85,85\n"]      # idle white
+        return super().__call__(cmd)
+
+
+def test_blue_bleed_before_the_trigger_does_not_halt():
+    """Blue on the error light between gate-close and the brew trigger is the ring's
+    ready glow, not a water error. Halting there would stop a healthy run right before
+    the brew -- which is the bug being fixed."""
+    front = BleedFront()
+    ok, msg = _run_cycle_with_front(front, ring_timeout=5)
+    assert ok, msg
+    assert front.bleed_reads > 0, "test is vacuous unless the window was sampled"
+    print(f"PASS: blue bleed ignored before the trigger ({front.bleed_reads} reads)")
+
+
+def test_red_still_halts_inside_the_bleed_window():
+    """Only BLUE is suppressed. The crosstalk is blue, so suppressing red or yellow
+    would be discarding real faults for nothing."""
+    front = BleedFront(bleed_rgb=b"220,20,20")
+    ok, msg = _run_cycle_with_front(front, ring_timeout=5)
+    assert not ok, msg
+    assert "Error light RED" in msg, msg
+    print("PASS: red still halts the run inside the blue-bleed window")
+
+
+def test_blue_after_the_trigger_still_halts():
+    """Once the brew is triggered the ring leaves its ready state, so blue on the error
+    light means a real water error again."""
+    class BlueAfterTrigger(FrontBoard):
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                if self.cap_pulses:
+                    return [b"RGB:ERROR:94,86,255\n"]
+                return [b"RGB:ERROR:85,85,85\n"]
+            return super().__call__(cmd)
+    ok, msg = _run_cycle_with_front(BlueAfterTrigger(), ring_timeout=5)
+    assert not ok, msg
+    assert "Error light BLUE" in msg, msg
+    print("PASS: blue after the trigger still halts as a water error")
+
+
+def test_suppressed_blue_is_not_treated_as_healthy():
+    """A suppressed reading is ignored, not evidence of health: it must reset the idle
+    streak, so a later 'ready ring' verdict can't be built on readings we chose not to
+    trust."""
+    dm = types.SimpleNamespace(dispenser=None, front=None)
+    runner = cc.CycleRunner(dm, 0, 5, None)
+    runner._error_clear_since = time.time() - 100      # a long-standing idle streak
+    assert runner._error_light_confirmed_idle()
+    runner._blue_bleed_window.set()
+    runner._error_clear_since = None                   # what the watcher does on a bleed
+    assert not runner._error_light_confirmed_idle()
+    print("PASS: a suppressed blue resets the idle streak instead of confirming health")
+
+
 def test_unreadable_error_light_halts_the_run():
     """The error light is now the ONLY error detector, so losing sight of it has to stop
     the run rather than let it continue blind."""
@@ -823,6 +897,10 @@ if __name__ == "__main__":
         test_retrigger_presses_the_brew_button_again_then_resumes,
         test_retrigger_gives_up_rather_than_hammering_the_button,
         test_brew_is_only_triggered_from_a_running_cycle,
+        test_blue_bleed_before_the_trigger_does_not_halt,
+        test_red_still_halts_inside_the_bleed_window,
+        test_blue_after_the_trigger_still_halts,
+        test_suppressed_blue_is_not_treated_as_healthy,
         test_unreadable_error_light_halts_the_run,
         test_unplugged_door_cover_says_so,
         test_ring_timeout_stops_run_as_error,

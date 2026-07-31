@@ -57,6 +57,12 @@ meant to show those four states, so it means the thresholds need tuning). Tune f
 - Never conclude "no fault" from one sample — a flashing fault color looks white for half
   its cycle. The pre-flight step waits `ERROR_LIGHT_CLEAR_S` (> one full period) and asks
   the watcher.
+- ⭐ **Blue bleed:** between gate-close and the brew trigger the ring's blue "ready" glow
+  bleeds onto the ERROR sensor, so **blue only** is ignored in that window
+  (`_blue_bleed_window`, set in `_run_one` before `_wait_for_blue`, cleared in
+  `_trigger_brew` at CAP ON). Red/yellow still halt there — the crosstalk is blue, so
+  suppressing more would discard real faults. A suppressed blue resets the idle streak
+  rather than counting as healthy.
 - An unreadable sensor (`ERROR_LIGHT_MAX_FAILS` consecutive bad reads) halts the run:
   it's the only error detector, so running blind is worse than stopping.
 - Ring **blue is disambiguated by the error light**, in both modes: the machine reuses

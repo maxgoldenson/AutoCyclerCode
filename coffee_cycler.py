@@ -22,6 +22,11 @@ or BLUE. The light is always on -- its idle color is ~white, which is healthy an
 must never be read as a fault. The ring only reports the green brew-complete flash
 (plus the legacy orange/yellow operator prompt). See the ERROR_LIGHT_* notes.
 
+BLUE BLEED: between gate-close and the brew trigger the machine shows its blue
+"time to go" ring, which bleeds onto the ERROR sensor beside it. Blue ONLY is
+ignored for the width of that window (red/yellow still halt), and a suppressed
+reading resets the idle streak rather than counting as healthy.
+
 Ring BLUE means either "time to go" (idle/ready) or a water error, and the error
 light tells them apart: confirmed idle white => ready, blue => water error. A
 ready ring while we are waiting for a brew means the trigger never took, so the
@@ -72,7 +77,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 21:20"
+VERSION = "2026-07-31 21:32"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -180,6 +185,20 @@ ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before hal
 # When the ring reads ready while we are waiting for a brew to finish, the brew trigger
 # never took and the machine is sitting at the START of a cycle: press the button again
 # and wait afresh rather than burning the whole ring timeout and halting the run.
+# -- Blue bleed onto the error sensor ------------------------------------------
+# Between gate-close and the brew trigger the machine shows its blue "time to go" RING,
+# and that blue bleeds onto the ERROR sensor sitting next to it. A blue error-light
+# reading in that window is therefore not trustworthy, and acting on it would halt a
+# perfectly healthy run right before the brew.
+#
+# So BLUE ONLY is ignored for the width of that window. Red and yellow still halt the
+# run there — the crosstalk is blue, so suppressing anything else would be throwing away
+# real faults for no reason. The window opens at gate-close and closes the instant CAP is
+# asserted, which is the narrowest span that covers the ring's ready glow.
+#
+# A suppressed blue does NOT count as evidence of health either: it resets the idle
+# streak, so a blue ring after the trigger still has to earn its "ready" verdict from
+# readings taken outside the window (see _error_light_confirmed_idle).
 RING_READY_CONFIRM_S = 2.0   # error light continuously idle white this long => "ready"
 RING_RETRIGGER_MAX   = 2     # brew re-triggers per cycle before giving up; a machine
                              # that keeps returning to ready is not going to be fixed
@@ -641,6 +660,9 @@ class CycleRunner:
         # When the watcher's current run of IDLE-WHITE error-light samples began
         # (None = no streak). Blue-ring disambiguation needs a streak, not one sample.
         self._error_clear_since: Optional[float] = None
+        # Set between gate-close and the brew trigger, while the ring is showing its blue
+        # "ready" glow — see BLUE_BLEED notes. Cross-thread (cycle sets, watcher reads).
+        self._blue_bleed_window = threading.Event()
         self._last_trigger_time = 0.0   # set by _trigger_brew
 
     @property
@@ -772,6 +794,15 @@ class CycleRunner:
                 fails = 0
                 r, g, b = rgb
                 color  = self._classify_error_light(r, g, b)
+                if color == "blue" and self._blue_bleed_window.is_set():
+                    # Ring's blue ready-glow bleeding onto the error sensor — see the
+                    # BLUE BLEED notes. Ignored, but NOT counted as healthy: reset the
+                    # idle streak so nothing downstream treats this as an all-clear.
+                    print(f"[errlight] blue ignored (ring ready-glow bleed) "
+                          f"R={r} G={g} B={b}")
+                    self._error_clear_since = None
+                    stop_flag.wait(ERROR_LIGHT_POLL_S)
+                    continue
                 if color in ERROR_LIGHT_FAULT_COLORS:
                     self._flag_error(f"Error light {color.upper()} -- "
                                      f"R={r} G={g} B={b}")
@@ -798,6 +829,7 @@ class CycleRunner:
         self._error_flag.clear()
         self._error_detail = ""
         self._error_clear_since = None   # no idle streak until this watcher samples
+        self._blue_bleed_window.clear()  # never leak suppression across cycles
         t = threading.Thread(target=self._error_light_worker, args=(stop_flag,),
                              daemon=True)
         t.start()
@@ -1000,6 +1032,9 @@ class CycleRunner:
         it wasn't asked to."""
         f = self.dev.front
         resp_cap = f.send("SET CAP ON", expect="CAP:")
+        # Brew triggered: the ring leaves its blue ready state, so the bleed window is
+        # over and a blue error light means a real water error again.
+        self._blue_bleed_window.clear()
         self._last_trigger_time = time.time()
         print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
         if not _sleep(CAP_PULSE_S, stop_flag):
@@ -1035,6 +1070,11 @@ class CycleRunner:
 
         # Gate settle — 1 s gap, then poll until machine shows blue (idle/ready).
         # CAP stays high-impedance throughout.
+        #
+        # The gate is now closed and the machine is about to show its blue ready ring,
+        # which bleeds onto the error sensor — open the blue-suppression window here and
+        # let _trigger_brew close it. Red/yellow keep halting throughout.
+        self._blue_bleed_window.set()
         if not _sleep(1.0, stop_flag): return self._abort_reason()
         if not self._wait_for_blue(stop_flag, status_cb): return self._abort_reason()
 
