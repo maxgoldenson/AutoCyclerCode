@@ -440,6 +440,32 @@ def test_error_light_classifies_fault_colors_not_brightness():
     print("PASS: error light classifies red/yellow/blue as faults, white as idle")
 
 
+def test_white_ish_readings_are_not_blue():
+    """The reported misread: a white-ish scan passing as blue and halting a good run.
+    Red and green still sit at the ~85 neutral level in these -- only blue has moved a
+    little -- so they are white to the eye and must classify as idle."""
+    classify = cc.CycleRunner._classify_error_light
+    for r, g, b in ((80, 78, 125), (90, 85, 140), (95, 90, 150), (88, 84, 158)):
+        assert classify(r, g, b) is None, \
+            f"({r},{g},{b}) is white-ish and must not read as blue"
+    # ...while genuine blues, including the real bleed reading, still classify.
+    for r, g, b in ((94, 86, 255), (10, 10, 220), (70, 70, 180), (90, 90, 190)):
+        assert classify(r, g, b) == "blue", f"({r},{g},{b}) must still read as blue"
+    print("PASS: white-ish tilts are idle, genuine blues still classify as blue")
+
+
+def test_blue_needs_all_three_gates():
+    """Blue takes dominance AND magnitude AND purity -- any one alone is what let the
+    white-ish readings through."""
+    metrics = cc.CycleRunner._blue_metrics
+    dominant, bright, pure, share = metrics(95, 90, 150)
+    assert not dominant, "1.58x must not count as dominant"
+    assert not pure, f"share {share:.2f} must not count as pure"
+    dominant, bright, pure, _ = metrics(94, 86, 255)
+    assert dominant and bright and pure, "the real bleed reading must pass all three"
+    print("PASS: blue requires dominance, magnitude and purity together")
+
+
 def test_rgb_reply_must_come_from_the_sensor_we_asked_for():
     """Both sensors are TCS34725s at the SAME I2C address -- only the mux tells them
     apart -- so an untagged reading is exactly as trustworthy as the mux. A tagged reply
@@ -888,6 +914,8 @@ if __name__ == "__main__":
         test_blue_ring_does_not_block_green,
         test_orange_ring_still_prompts_the_operator,
         test_error_light_classifies_fault_colors_not_brightness,
+        test_white_ish_readings_are_not_blue,
+        test_blue_needs_all_three_gates,
         test_error_light_is_identical_in_both_modes,
         test_rgb_reply_must_come_from_the_sensor_we_asked_for,
         test_color_reads_ask_for_a_sensor_tag,

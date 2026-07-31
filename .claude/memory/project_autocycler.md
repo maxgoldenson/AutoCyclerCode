@@ -48,7 +48,13 @@ its COLOR is the signal, not whether it's lit. Idle is **~white and healthy**; o
 moment it shows a fault color. `_classify_error_light` does the classification on
 chromaticity (`readRGB()` divides each channel by clear, so brightness is normalized out):
 near-neutral within `ERROR_LIGHT_WHITE_MAX_SPREAD` is idle, and the three fault colors are
-matched by channel ratios like the ring classifier. **Reading white as a fault would halt
+matched by channel ratios like the ring classifier. ⭐ **Blue needs three gates, not one**
+(`_blue_metrics`: dominance ≥2.0x both channels, magnitude ≥160, purity ≥0.50 share) —
+a single 1.4x ratio let white-ish scans (red/green still at the ~85 neutral, only blue
+nudged) read as blue and halt healthy runs. Measured impostors top out ~1.67x / 0.45
+share, real blues start ~2.1x / 0.51, so the thresholds sit in that gap. A blue-ish
+reading that misses prints its metrics and the failed gate — that log line is the tuning
+data, and a REAL blue landing there is a water error going unhalted. **Reading white as a fault would halt
 every run on a good machine** — that direction is the one to protect. A saturated color
 matching none of the three is logged as unclassified and NOT halted (the light is only
 meant to show those four states, so it means the thresholds need tuning). Tune from the

@@ -77,7 +77,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 21:38"
+VERSION = "2026-07-31 21:46"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -168,8 +168,25 @@ ERROR_LIGHT_RED_R_OVER_B     = 1.6
 ERROR_LIGHT_YELLOW_R_OVER_B  = 1.6
 ERROR_LIGHT_YELLOW_G_OVER_B  = 1.6
 ERROR_LIGHT_YELLOW_RG_DIFF   = 60   # red and green comparable => yellow, not red
-ERROR_LIGHT_BLUE_B_OVER_R    = 1.4
-ERROR_LIGHT_BLUE_B_OVER_G    = 1.4
+# Blue is the fault color a white-ish reading fakes most easily, and it was doing so:
+# ambient light and the ring's glow both tilt the sensor slightly blue without the error
+# light having changed at all. Neutral chromaticity is r≈g≈b≈85, so a mild tilt like
+# (80,78,125) clears a 1.4x ratio while still being plainly white — red and green are
+# still sitting at the neutral level, only blue has moved.
+#
+# Blue therefore has to satisfy THREE independent conditions, where red and yellow need
+# one. Measured against real readings, the white-ish impostors top out around 1.67x /
+# 0.45 share and genuine blues start around 2.1x / 0.51 share, so each threshold sits in
+# that gap rather than being picked by feel:
+#   dominance — b beats BOTH other channels by this much (impostors: <=1.67)
+#   magnitude — b itself is high (impostors: <=150, real blues: >=180)
+#   purity    — b's share of r+g+b (neutral is 0.333, impostors: <=0.45)
+# A blue that misses these is logged with all three metrics (see the unclassified
+# branch), so tuning against a real machine needs no extra instrumentation.
+ERROR_LIGHT_BLUE_B_OVER_R    = 2.0
+ERROR_LIGHT_BLUE_B_OVER_G    = 2.0
+ERROR_LIGHT_BLUE_MIN_B       = 160
+ERROR_LIGHT_BLUE_MIN_SHARE   = 0.50
 ERROR_LIGHT_FAULT_COLORS = ("red", "yellow", "blue")
 ERROR_LIGHT_POLL_S    = 0.2   # sample interval — several samples per flash period
 ERROR_LIGHT_CLEAR_S   = 1.6   # pre-flight observation window (> one full 1 Hz period)
@@ -725,10 +742,24 @@ class CycleRunner:
                 and g > b * ERROR_LIGHT_YELLOW_G_OVER_B
                 and abs(r - g) <= ERROR_LIGHT_YELLOW_RG_DIFF):
             return "yellow"
-        if (b > r * ERROR_LIGHT_BLUE_B_OVER_R
-                and b > g * ERROR_LIGHT_BLUE_B_OVER_G):
+        dominant, bright, pure, _share = CycleRunner._blue_metrics(r, g, b)
+        if dominant and bright and pure:
             return "blue"
         return None
+
+    @staticmethod
+    def _blue_metrics(r, g, b) -> tuple:
+        """-> (dominant, bright, pure, share) for the three-part blue test.
+
+        Split out from _classify_error_light so a near-miss can be LOGGED with the exact
+        metric that failed. A blue error light that stops halting runs is a missed water
+        error, so the tuning data has to be in the log by default, not behind a rebuild."""
+        total = max(1, r + g + b)
+        share = b / total
+        return (b > r * ERROR_LIGHT_BLUE_B_OVER_R and b > g * ERROR_LIGHT_BLUE_B_OVER_G,
+                b >= ERROR_LIGHT_BLUE_MIN_B,
+                share >= ERROR_LIGHT_BLUE_MIN_SHARE,
+                share)
 
     def _flag_error(self, detail: str):
         print(f"[errlight] {detail}")
@@ -814,6 +845,18 @@ class CycleRunner:
                     # (see _classify_error_light), but it should never happen — log it
                     # loudly so the thresholds can be tuned against a real reading.
                     hint = ""
+                    dominant, bright, pure, share = self._blue_metrics(r, g, b)
+                    if dominant or bright or pure:
+                        # Leaned blue but missed at least one gate. Name the failures and
+                        # the numbers: this is the line to tune ERROR_LIGHT_BLUE_* from,
+                        # and a REAL blue landing here is a water error going unhalted.
+                        missed = ", ".join(n for n, ok in (
+                            (f"dominance(<{ERROR_LIGHT_BLUE_B_OVER_R}x)", dominant),
+                            (f"magnitude(<{ERROR_LIGHT_BLUE_MIN_B})", bright),
+                            (f"purity(<{ERROR_LIGHT_BLUE_MIN_SHARE})", pure)) if not ok)
+                        hint = (f"  [blue-ish: b/r={b / max(1, r):.2f} "
+                                f"b/g={b / max(1, g):.2f} share={share:.2f}; "
+                                f"failed {missed}]")
                     if self._classify_ring_color(r, g, b) == "green":
                         # The error light has no green state; the RING does, at brew
                         # completion. Seeing green here means this channel is looking at
