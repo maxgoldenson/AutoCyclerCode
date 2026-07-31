@@ -610,6 +610,28 @@ def test_unreadable_error_light_halts_the_run():
     print("PASS: an unreadable error light halts the run instead of running blind")
 
 
+def test_unplugged_door_cover_says_so():
+    """The door cover is hot-pluggable and carries the mux AND both sensors, so an
+    unplugged cover is a routine way to lose the error light. The firmware says which
+    link is missing; that has to reach the operator instead of a generic 'unreadable',
+    otherwise a reseat job looks like a dead sensor."""
+    class NoCoverFront(FrontBoard):
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                return [b"ERROR:door cover not detected (no I2C mux)\n"]
+            return super().__call__(cmd)
+    saved = cc.ERROR_LIGHT_MAX_FAILS
+    cc.ERROR_LIGHT_MAX_FAILS = 3
+    try:
+        ok, msg = _run_cycle_with_front(NoCoverFront())
+    finally:
+        cc.ERROR_LIGHT_MAX_FAILS = saved
+    assert not ok, msg
+    assert "door cover not detected" in msg, msg
+    assert "Stopped" not in msg, msg
+    print("PASS: an unplugged door cover halts with the reason, not just 'unreadable'")
+
+
 def test_ring_timeout_stops_run_as_error():
     """No green flash within ring_timeout must halt the run as an ERROR. It used to
     'proceed anyway', silently dispensing cycle after cycle into a machine that never
@@ -727,6 +749,7 @@ if __name__ == "__main__":
         test_retrigger_gives_up_rather_than_hammering_the_button,
         test_brew_is_only_triggered_from_a_running_cycle,
         test_unreadable_error_light_halts_the_run,
+        test_unplugged_door_cover_says_so,
         test_ring_timeout_stops_run_as_error,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,

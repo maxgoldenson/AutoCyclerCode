@@ -20,7 +20,7 @@ and match the line it expects.
 | `GET STATUS` | DISP | `STATUS:<bootId>,<lastSeq>,<lastDeg>` | idempotent — verifies a dispense |
 | `SET ANGLE <deg> [<seq>]` | DISP | `ANGLE:<deg>` | **relative** stepper move (the dose). **NON-idempotent** — see below |
 | `SET MOTOR ON\|OFF` | DISP | `MOTOR:ON\|OFF` | hold/release the driver enable line |
-| `GET COLOR [ERROR\|RING] [LED]` | FRONT | `RGB:<r>,<g>,<b>` | default sensor = ERROR; `LED` keeps the LED lit; values 0–255 (normalized by clear channel) |
+| `GET COLOR [ERROR\|RING] [LED]` | FRONT | `RGB:<r>,<g>,<b>` **or** `ERROR:<reason>` | default sensor = ERROR; `LED` keeps the LED lit; values 0–255 (normalized by clear channel, so they are chromaticity — brightness is divided out). The door cover is hot-pluggable, so `ERROR:` here is routine — see below |
 | `SET SERVO <0-180>` | FRONT | `SERVO:<angle>` | gate position; firmware clamps to 0–180 |
 | `SET CAP ON\|OFF` | FRONT | `CAP:ON\|OFF` | brew trigger (drives the pin LOW); auto-releases after 15 s |
 | *(on boot)* | both | `READY:<id>` | sent once at startup |
@@ -40,10 +40,42 @@ until one **starts with `expect`**, discarding blanks and garbage (logged as
 times. Callers test the prefix and parse the tail:
 
 ```python
-resp = f.send("GET COLOR RING", expect="RGB:")
+resp = f.send("GET COLOR RING", expect="RGB:", accept=("ERROR:",))
 if resp.startswith("RGB:"):
     r, g, b = (int(x) for x in resp[4:].split(","))
 ```
+
+**`accept=` — prefixes that are an ANSWER, not noise.** By default anything that isn't
+`expect` is discarded and the whole command is retried. That's right for line noise, but
+wrong for a typed reply that definitively answers the question: a board saying
+`ERROR:door cover not detected` has answered, and retrying it twice more only delays the
+caller and buries the reason. Every `GET COLOR` call site passes `accept=("ERROR:",)` so
+the reason reaches the operator instead of the garbage log.
+
+## ⭐ The door cover is HOT-PLUGGABLE
+
+The door cover carries the I2C mux **and both color sensors**, so the whole I2C chain can
+vanish and return at any time — including being absent at boot. The firmware therefore
+assumes nothing from `setup()`: every color read re-establishes the chain, and
+`setup()`'s sensor init is only a warm-up, with absence reported as
+`EVENT:DOOR_COVER_ABSENT` rather than an error.
+
+It does **not** re-run Adafruit's `begin()` on every read — that powers the ADC and blocks
+a full integration period (~55 ms), and `getRawData()` already carries its own ~51 ms
+trailing delay, so doing it unconditionally would roughly double every read while the host
+polls the error light continuously. Instead each read verifies the chain cheaply (~2 ms)
+and re-initializes only what is missing:
+
+1. mux ACKs at `0x70` → else `ERROR:door cover not detected (no I2C mux)`
+2. sensor ID reads back → else `ERROR:color sensor not responding`
+3. `ENABLE == PON|AEN` → else the chip lost power on a replug; `begin()` restores gain /
+   integration / enable, or `ERROR:color sensor init failed`
+
+Step 3 is the subtle one: after a power cycle the sensor still ACKs and still reports the
+right ID, but its configuration is gone and it returns **zeros**. On this machine a dark
+error light means "no fault", so mistaking an unconfigured chip for a dark one would
+silently disarm the error detector. A wedged bus (cover pulled mid-transfer, SDA stuck
+low) is cleared by `i2cRecover()`, which clocks the bus free and restarts `Wire`.
 
 ## ⭐ The idempotency rule — the single most important constraint
 

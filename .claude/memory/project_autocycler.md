@@ -64,6 +64,14 @@ strong cast. That catches every fault color without enumerating them. Tune
   `_do_cap_reset` — both reachable only from a requested run. The GUI never asserts CAP.
   A test pins this: the cycler must never brew when it wasn't asked to.
 
+**Door cover is hot-pluggable:** it carries the I2C mux AND both color sensors, so the
+whole chain can vanish/return at any time. `AUTOCYCLER_FRONT.ino` re-establishes it on
+every color read (`ensureSensor`), re-initializing only what's actually missing rather
+than paying `begin()`'s ~55 ms each time; `GET COLOR` answers `ERROR:<which link>` and the
+host passes that through to the operator. Unplugging mid-run halts the run (no error light
+= no fault detection, by design); replugging recovers with no reboot. See the
+`serial-protocol` skill.
+
 **Kiosk input hardening:** USB autosuspend is disabled at boot
 (`launcher.harden_usb_input()`, plus a udev rule from `pi_install.sh`) — an idle numpad
 that suspends can fail to wake for the whole session, which showed up as "pendant dead

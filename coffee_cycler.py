@@ -71,7 +71,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 18:23"
+VERSION = "2026-07-31 18:35"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -305,11 +305,17 @@ class SerialDevice:
                 pass
             raise
 
-    def _attempt(self, cmd: str, expect: Optional[str], timeout: float) -> Optional[str]:
+    def _attempt(self, cmd: str, expect: Optional[str], timeout: float,
+                 accept: tuple = ()) -> Optional[str]:
         """
         One write + read cycle. Returns the first line matching `expect` (or any
         non-blank line if `expect` is None), or None if no valid response arrives
         before `timeout`. Caller MUST hold self._lock.
+
+        `accept` is a tuple of additional prefixes that also END the read. Use it for
+        replies that are a definitive ANSWER rather than noise — `ERROR:` to a
+        `GET COLOR`, say — so they're returned to the caller instead of being discarded
+        as garbage and retried.
         """
         self._ser.reset_input_buffer()
         self._ser.write((cmd + "\n").encode())
@@ -322,17 +328,22 @@ class SerialDevice:
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue  # blank line — keep draining
-            if expect is None or line.startswith(expect):
+            if expect is None or line.startswith(expect) or line.startswith(accept):
                 return line
             print(f"[serial] discard garbage ({cmd!r}): {line!r}")
         return None
 
-    def send(self, cmd: str, expect: str = None, retries: int = 2) -> str:
+    def send(self, cmd: str, expect: str = None, retries: int = 2,
+             accept: tuple = ()) -> str:
         """
         Send cmd and return the response line.
         If expect is given, any line that doesn't start with it is discarded as
         garbage and reading continues.  The full send+read cycle is retried up to
         `retries` times before giving up.
+
+        `accept` lists further prefixes that count as a real answer (see _attempt).
+        A board reporting `ERROR:no sensor` has answered; retrying it twice more just
+        delays the caller and buries the reason.
 
         SAFETY: only route IDEMPOTENT commands through here — reads (GET COLOR,
         WHO AM I) and absolute set-points (SET SERVO, SET CAP). A retry re-writes the
@@ -345,7 +356,7 @@ class SerialDevice:
             for attempt in range(retries + 1):
                 if attempt:
                     time.sleep(0.3)
-                line = self._attempt(cmd, expect, timeout)
+                line = self._attempt(cmd, expect, timeout, accept)
                 if line is not None:
                     return line
                 print(f"[serial] no valid response, attempt {attempt + 1}/{retries + 1}: {cmd!r}")
@@ -604,7 +615,7 @@ class CycleRunner:
             if stop_flag.is_set() or self._error_flag.is_set():
                 return False
             status_cb(4, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
-            resp = f.send("GET COLOR RING", expect="RGB:")
+            resp = f.send("GET COLOR RING", expect="RGB:", accept=("ERROR:",))
             if resp.startswith("RGB:"):
                 try:
                     r, g, b = (int(x) for x in resp[4:].split(","))
@@ -661,25 +672,36 @@ class CycleRunner:
     def _error_light_worker(self, stop_flag):
         f     = self.dev.front
         fails = 0
+        reason = ""     # last thing the board said instead of an RGB reading
         while not stop_flag.is_set() and not self._error_flag.is_set():
-            rgb = None
+            rgb  = None
+            resp = ""
             try:
-                resp = f.send("GET COLOR ERROR", expect="RGB:")
+                resp = f.send("GET COLOR ERROR", expect="RGB:",
+                              accept=("ERROR:",))
                 if resp.startswith("RGB:"):
                     rgb = tuple(int(x) for x in resp[4:].split(","))
             except ValueError:
                 rgb = None            # malformed RGB payload — treat as a failed read
             except Exception as e:
                 print(f"[errlight] read failed: {e}")
+                resp = str(e)
             if rgb is None:
                 fails += 1
                 # Lost sight of the light — that is not evidence it is dark, so the
                 # "confirmed dark" streak has to start over.
                 self._error_clear_since = None
+                if resp:
+                    reason = resp
                 if fails >= ERROR_LIGHT_MAX_FAILS:
                     # Can't see the light at all. Since it is the only error detector,
-                    # running blind is worse than stopping.
-                    self._flag_error(f"Error light unreadable -- {fails} bad reads")
+                    # running blind is worse than stopping. The board says WHICH link is
+                    # missing (unplugged door cover vs a sensor that reads nothing), so
+                    # pass it straight through rather than making someone read the log.
+                    detail = f"Error light unreadable -- {fails} bad reads"
+                    if reason:
+                        detail += f" ({reason})"
+                    self._flag_error(detail)
                     return
             else:
                 fails = 0
@@ -741,7 +763,7 @@ class CycleRunner:
             if self._error_flag.is_set(): return "error", self._error_detail
             status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
 
-            resp = f.send("GET COLOR RING", expect="RGB:")
+            resp = f.send("GET COLOR RING", expect="RGB:", accept=("ERROR:",))
             print(f"[serial] GET COLOR RING -> {resp!r}")
             if not resp.startswith("RGB:"):
                 continue
