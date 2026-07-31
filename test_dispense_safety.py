@@ -275,7 +275,7 @@ class FrontBoard:
         if cmd.startswith("SET SERVO"):
             return [b"SERVO:OK\n"]
         if cmd.startswith("GET COLOR ERROR"):
-            return [b"RGB:10,10,10\n"]
+            return [b"RGB:85,85,85\n"]   # idle white -- the light is always on
         if cmd.startswith("GET COLOR RING"):
             if self.cap_pulses:
                 return [b"RGB:10,220,10\n"]   # green -- brew complete
@@ -425,16 +425,35 @@ def test_orange_ring_still_prompts_the_operator():
 
 
 # --- error light: the actual error detector ---------------------------------
-def test_error_light_saturation_detects_every_color():
-    """The board returns chromaticity (each channel / clear), so 'lit' is a saturation
-    test -- it must catch the blue water error, not just the legacy red rule."""
-    lit = cc.CycleRunner._error_light_lit
-    assert lit(10, 10, 220),  "blue water error must count as lit"
-    assert lit(220, 20, 20),  "red must count as lit"
-    assert lit(200, 180, 20), "yellow must count as lit"
-    assert not lit(85, 85, 85), "neutral (unlit under the fixture LED) must be clear"
-    assert not lit(90, 85, 80), "near-neutral sensor noise must not trip it"
-    print("PASS: error light detects any lit color, ignores a neutral read")
+def test_error_light_classifies_fault_colors_not_brightness():
+    """The error light is ALWAYS ON: its COLOR is the signal. Idle is ~white and healthy;
+    only red / yellow / blue are faults. Reading a white idle light as a fault would halt
+    every run on a perfectly good machine, so that direction matters most."""
+    classify = cc.CycleRunner._classify_error_light
+    assert classify(220, 20, 20)  == "red",    classify(220, 20, 20)
+    assert classify(200, 180, 20) == "yellow", classify(200, 180, 20)
+    assert classify(10, 10, 220)  == "blue",   classify(10, 10, 220)
+    # Idle white and its realistic variations must NOT be faults.
+    assert classify(85, 85, 85) is None,  "idle white is healthy, not a fault"
+    assert classify(90, 85, 80) is None,  "sensor noise around white is still idle"
+    assert classify(100, 85, 70) is None, "a warm-tinted idle white is still idle"
+    print("PASS: error light classifies red/yellow/blue as faults, white as idle")
+
+
+def test_error_light_is_identical_in_both_modes():
+    """The error light must behave the same on 2.2.x and 3.0 -- nothing in its path may
+    branch on the machine mode."""
+    import inspect
+    for name in ("_classify_error_light", "_error_light_worker",
+                 "_error_light_confirmed_idle", "_check_error_light"):
+        src = inspect.getsource(getattr(cc.CycleRunner, name))
+        assert "self.machine" not in src, f"{name} must not consult the machine mode"
+    dm = types.SimpleNamespace(dispenser=None, front=None)
+    for machine in ("2.2", "3.0"):
+        runner = cc.CycleRunner(dm, 0, 5, None, machine=machine)
+        assert runner._classify_error_light(10, 10, 220) == "blue"
+        assert runner._classify_error_light(85, 85, 85) is None
+    print("PASS: error-light behavior and polling are identical in both modes")
 
 
 class ErrorLightFront(FrontBoard):
@@ -479,7 +498,7 @@ def _run_cycle_with_front(front_model, ring_timeout=5):
 def test_error_light_halts_the_run():
     ok, msg = _run_cycle_with_front(ErrorLightFront(clear_reads=1))
     assert not ok, msg
-    assert "Error light ON" in msg, msg
+    assert "Error light BLUE" in msg, msg
     # Must NOT contain "Stopped": that routes to the quiet user-stop path in the GUI
     # and would hide the fault instead of raising a red status + ntfy alert.
     assert "Stopped" not in msg, msg
@@ -494,7 +513,7 @@ def test_error_light_clear_lets_the_cycle_finish():
 
 # --- blue ring + dark error light = "ready", so re-trigger the brew -----------
 def _ready_ring_runner(ring_reads, ring_timeout=1):
-    """Runner whose ring reads from a script and whose error light is always dark."""
+    """Runner whose ring reads from a script and whose error light is always idle white."""
     q = list(ring_reads)
     def handler(cmd):
         if cmd.startswith("GET COLOR ERROR"):
@@ -517,20 +536,21 @@ def test_ready_ring_asks_for_a_retrigger():
     print("PASS: ready ring + dark error light -> asks for a brew re-trigger")
 
 
-def test_blue_ring_waits_for_a_confirmed_dark_streak():
-    """A single dark sample is not enough at 1 Hz -- it can land between blinks. Until
-    the streak is long enough, blue carries no information and we keep polling."""
+def test_blue_ring_waits_for_a_confirmed_idle_streak():
+    """One white sample is not enough at 1 Hz -- a light flashing a fault color looks
+    white for half its cycle. Until the streak is long enough, blue carries no
+    information and we keep polling."""
     runner = _ready_ring_runner([b"RGB:10,10,220\n"])
     runner._error_clear_since = time.time()          # streak just started
     outcome, _d = runner._wait_for_ring(time.time(), threading.Event(),
                                         lambda _n, _lbl: None)
     assert outcome == "timeout", outcome
     runner2 = _ready_ring_runner([b"RGB:10,10,220\n"])
-    runner2._error_clear_since = None                # never seen dark at all
+    runner2._error_clear_since = None                # never seen idle at all
     outcome2, _d2 = runner2._wait_for_ring(time.time(), threading.Event(),
                                            lambda _n, _lbl: None)
     assert outcome2 == "timeout", outcome2
-    print("PASS: blue needs a CONFIRMED dark streak before it counts as ready")
+    print("PASS: blue needs a CONFIRMED idle-white streak before it counts as ready")
 
 
 def test_retrigger_presses_the_brew_button_again_then_resumes():
@@ -740,11 +760,12 @@ if __name__ == "__main__":
         test_blue_ring_never_warns_in_either_mode,
         test_blue_ring_does_not_block_green,
         test_orange_ring_still_prompts_the_operator,
-        test_error_light_saturation_detects_every_color,
+        test_error_light_classifies_fault_colors_not_brightness,
+        test_error_light_is_identical_in_both_modes,
         test_error_light_halts_the_run,
         test_error_light_clear_lets_the_cycle_finish,
         test_ready_ring_asks_for_a_retrigger,
-        test_blue_ring_waits_for_a_confirmed_dark_streak,
+        test_blue_ring_waits_for_a_confirmed_idle_streak,
         test_retrigger_presses_the_brew_button_again_then_resumes,
         test_retrigger_gives_up_rather_than_hammering_the_button,
         test_brew_is_only_triggered_from_a_running_cycle,

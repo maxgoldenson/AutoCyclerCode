@@ -40,22 +40,28 @@ watch error light 1 flash period → SET ANGLE 360 (~19 g) → servo OPEN → 3 
 - Green-flash timeout (`ring_timeout`, default 120 s) halts the run as an ERROR
   (red status + ntfy alert); it no longer proceeds to the next cycle.
 
-**ERRORS COME FROM THE ERROR LIGHT, NOT THE RING.** The error light is a dead marker —
-dark unless something is wrong, flashing ~1 Hz in any fault color (blue = water error).
+**ERRORS COME FROM THE ERROR LIGHT, NOT THE RING.** ⭐ The error light is **always on** —
+its COLOR is the signal, not whether it's lit. Idle is **~white and healthy**; only
+**red / yellow / blue** are faults (blue = water error), flashing at ~1 Hz.
 `CycleRunner._error_light_worker` is a daemon thread that samples it for the WHOLE cycle
 (including the dispense, which blocks on the *other* serial port) and halts the run the
-moment it lights. Detection is a **saturation** test (`_error_light_lit`), because the
-firmware's `readRGB()` divides each channel by the clear channel — brightness is already
-normalized out, so an unlit indicator reads near-neutral and any lit color reads as a
-strong cast. That catches every fault color without enumerating them. Tune
-`ERROR_LIGHT_SAT_MIN` from the `[errlight]` log lines if the field disagrees.
-- Never conclude "clear" from one sample — the light blinks. The pre-flight step waits
-  `ERROR_LIGHT_CLEAR_S` (> one full period) and asks the watcher.
+moment it shows a fault color. `_classify_error_light` does the classification on
+chromaticity (`readRGB()` divides each channel by clear, so brightness is normalized out):
+near-neutral within `ERROR_LIGHT_WHITE_MAX_SPREAD` is idle, and the three fault colors are
+matched by channel ratios like the ring classifier. **Reading white as a fault would halt
+every run on a good machine** — that direction is the one to protect. A saturated color
+matching none of the three is logged as unclassified and NOT halted (the light is only
+meant to show those four states, so it means the thresholds need tuning). Tune from the
+`[errlight]` log lines. Identical on 2.2.x and 3.0 — nothing in the path reads
+`self.machine`, pinned by `test_error_light_is_identical_in_both_modes`.
+- Never conclude "no fault" from one sample — a flashing fault color looks white for half
+  its cycle. The pre-flight step waits `ERROR_LIGHT_CLEAR_S` (> one full period) and asks
+  the watcher.
 - An unreadable sensor (`ERROR_LIGHT_MAX_FAILS` consecutive bad reads) halts the run:
   it's the only error detector, so running blind is worse than stopping.
 - Ring **blue is disambiguated by the error light**, in both modes: the machine reuses
   blue for "time to go" (idle/ready) and for a water error, and the light settles it —
-  confirmed dark (`_error_light_confirmed_dark`, a continuous streak ≥
+  confirmed idle white (`_error_light_confirmed_idle`, a continuous streak ≥
   `RING_READY_CONFIRM_S`, never a single sample) means ready. A ready ring while waiting
   for green means the brew trigger never took, so `_run_one` re-presses the brew button
   (`_trigger_brew`) and waits afresh, bounded by `RING_RETRIGGER_MAX`; past that it halts

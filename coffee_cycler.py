@@ -6,23 +6,24 @@ Devices are auto-discovered by their WHO AM I response and the
 COM port assignments are persisted to autocycler_config.json.
 
 Cycle sequence per brew (identical for both machine modes):
-  1. Watch the error light for one flash period -- abort if it is lit
+  1. Watch the error light for one flash period -- abort if it shows a fault color
   2. SET ANGLE 360    -- dispense ~19 g
   3. Servo OPEN -> 3 s -> CLOSE
   4. Wait for blue (ready), SET CAP ON -> pulse -> OFF  -- trigger machine brew
   5. Wait RING_WAIT_MIN_S, then poll Ring sensor for green completion flash
      * Green flash       -> proceed to next cycle
-     * Blue + dark light -> the trigger never took: press brew again and resume
+     * Blue + idle light -> the trigger never took: press brew again and resume
      * Orange / yellow   -> pause and prompt user (resume / reset / stop)
      * Timeout           -> assume the brew failed: halt the run as an error
 
 ERRORS COME FROM THE ERROR LIGHT, NOT THE RING. A background watcher samples the
-error light for the whole cycle and halts the run the moment it lights in ANY
-color; the ring only reports the green brew-complete flash (plus the legacy
-orange/yellow operator prompt). See the ERROR_LIGHT_* notes.
+error light for the whole cycle and halts the run the moment it turns RED, YELLOW
+or BLUE. The light is always on -- its idle color is ~white, which is healthy and
+must never be read as a fault. The ring only reports the green brew-complete flash
+(plus the legacy orange/yellow operator prompt). See the ERROR_LIGHT_* notes.
 
 Ring BLUE means either "time to go" (idle/ready) or a water error, and the error
-light is what tells them apart: confirmed dark => ready, lit => water error. A
+light tells them apart: confirmed idle white => ready, blue => water error. A
 ready ring while we are waiting for a brew means the trigger never took, so the
 cycle re-presses the brew button (bounded by RING_RETRIGGER_MAX) and waits
 afresh rather than burning the ring timeout. The brew button is pressed from
@@ -71,7 +72,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 18:35"
+VERSION = "2026-07-31 20:53"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -133,21 +134,38 @@ SERVO_REST = 95
 SERVO_OPEN = 135
 
 # -- Error light ---------------------------------------------------------------
-# The machine's error light is a DEAD MARKER: it is dark unless something is wrong, and
-# when something IS wrong it flashes at ~1 Hz in whatever color the fault maps to (blue
-# for a water error, red/amber for others). That makes it a far better error signal than
-# the ring, which reuses colors across healthy and faulted states.
+# The error light is ALWAYS ON. Its COLOR is the signal, not whether it is lit:
 #
-# Detection is a SATURATION test, not a brightness or per-color one. The firmware's
+#   ~white            -> idle. The machine is fine. This is the normal resting state.
+#   red / yellow / blue -> a fault. Blue specifically is the water error.
+#
+# So this is a color CLASSIFICATION, not a brightness or "is it on" test. The firmware's
 # readRGB() divides every channel by the CLEAR channel, so brightness is already divided
-# out and what comes back is chromaticity: an unlit indicator under the fixture's
-# illumination LED reads near-neutral (r ~ g ~ b) and ANY lit color reads as a strong
-# color cast. Testing max-minus-min therefore catches every error color without having to
-# enumerate them -- which is the whole point, since the light means "some error".
+# out and what arrives is chromaticity: idle white reads near-neutral (r ~ g ~ b) and a
+# fault color reads as a strong cast. A near-neutral reading is therefore the HEALTHY
+# state and must never be treated as a fault -- getting that backwards would halt every
+# run on a perfectly good machine.
 #
-# Because it FLASHES, one sample can land in the dark half of the cycle: never conclude
-# "clear" from a single read. ERROR_LIGHT_CLEAR_S covers more than a full flash period.
-ERROR_LIGHT_SAT_MIN   = 60    # max(r,g,b) - min(r,g,b) at/above this = lit
+# Only the three named fault colors halt a run. A saturated reading that matches none of
+# them is logged as unclassified and left alone: the light is only ever meant to show
+# white or those three, so an unrecognized color means the thresholds need tuning, not
+# that the machine is broken.
+#
+# Because it FLASHES the fault color at ~1 Hz, one sample can land in the white half of
+# the blink: never conclude "no fault" from a single read. ERROR_LIGHT_CLEAR_S covers
+# more than a full flash period.
+#
+# The behavior above is IDENTICAL on 2.2.x and 3.0 -- nothing in the error-light path
+# consults the machine mode (pinned by test_error_light_is_identical_in_both_modes).
+ERROR_LIGHT_WHITE_MAX_SPREAD = 45   # max(r,g,b)-min(r,g,b) at/below this = idle white
+ERROR_LIGHT_RED_R_OVER_G     = 1.6
+ERROR_LIGHT_RED_R_OVER_B     = 1.6
+ERROR_LIGHT_YELLOW_R_OVER_B  = 1.6
+ERROR_LIGHT_YELLOW_G_OVER_B  = 1.6
+ERROR_LIGHT_YELLOW_RG_DIFF   = 60   # red and green comparable => yellow, not red
+ERROR_LIGHT_BLUE_B_OVER_R    = 1.4
+ERROR_LIGHT_BLUE_B_OVER_G    = 1.4
+ERROR_LIGHT_FAULT_COLORS = ("red", "yellow", "blue")
 ERROR_LIGHT_POLL_S    = 0.2   # sample interval — several samples per flash period
 ERROR_LIGHT_CLEAR_S   = 1.6   # pre-flight observation window (> one full 1 Hz period)
 ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before halting:
@@ -155,14 +173,14 @@ ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before hal
 
 # -- Blue-ring disambiguation --------------------------------------------------
 # A blue RING means either "time to go" (idle, ready to brew) or a water error. The
-# ERROR LIGHT settles it: dark => ready, lit => water error. Because the light blinks,
-# "dark" is only meaningful once it has been continuously dark for longer than a full
-# flash period, so a sample that lands between blinks can't be mistaken for all-clear.
+# ERROR LIGHT settles it: idle white => ready, blue => water error. Because a fault
+# color FLASHES, "idle" is only meaningful once the light has been continuously white for
+# longer than a full flash period -- a sample taken between blinks looks white too.
 #
 # When the ring reads ready while we are waiting for a brew to finish, the brew trigger
 # never took and the machine is sitting at the START of a cycle: press the button again
 # and wait afresh rather than burning the whole ring timeout and halting the run.
-RING_READY_CONFIRM_S = 2.0   # error light continuously dark this long => "ready"
+RING_READY_CONFIRM_S = 2.0   # error light continuously idle white this long => "ready"
 RING_RETRIGGER_MAX   = 2     # brew re-triggers per cycle before giving up; a machine
                              # that keeps returning to ready is not going to be fixed
                              # by more pulses, and hammering the button is a hazard
@@ -589,8 +607,8 @@ class CycleRunner:
         # Set by the error-light watcher thread; read by every wait loop in the cycle.
         self._error_flag   = threading.Event()
         self._error_detail = ""
-        # When the watcher's current run of DARK error-light samples began (None = no
-        # streak). Blue-ring disambiguation needs a streak, not a single sample.
+        # When the watcher's current run of IDLE-WHITE error-light samples began
+        # (None = no streak). Blue-ring disambiguation needs a streak, not one sample.
         self._error_clear_since: Optional[float] = None
         self._last_trigger_time = 0.0   # set by _trigger_brew
 
@@ -637,23 +655,41 @@ class CycleRunner:
     # per port, so sharing the front board with the cycle worker is safe.
 
     @staticmethod
-    def _error_light_lit(r, g, b) -> bool:
-        """True when the error light is lit in ANY color -- see the ERROR_LIGHT_* notes:
-        the board hands back chromaticity, so saturation (not brightness, not a per-color
-        rule) is what separates a dark indicator from a lit one."""
-        return (max(r, g, b) - min(r, g, b)) >= ERROR_LIGHT_SAT_MIN
+    def _classify_error_light(r, g, b) -> Optional[str]:
+        """-> "red" | "yellow" | "blue" for a fault, or None when the light is showing
+        its normal idle white.
+
+        The light is always on, so this classifies COLOR (see the ERROR_LIGHT_* notes).
+        Near-neutral is the healthy resting state and returns None. A saturated color
+        that matches none of the three fault colors also returns None -- unexpected, but
+        the caller logs it, and halting a run on a color the machine isn't supposed to
+        show would be a worse failure than missing it."""
+        if (max(r, g, b) - min(r, g, b)) <= ERROR_LIGHT_WHITE_MAX_SPREAD:
+            return None                      # idle white -- the machine is fine
+        if (r > g * ERROR_LIGHT_RED_R_OVER_G
+                and r > b * ERROR_LIGHT_RED_R_OVER_B):
+            return "red"
+        if (r > b * ERROR_LIGHT_YELLOW_R_OVER_B
+                and g > b * ERROR_LIGHT_YELLOW_G_OVER_B
+                and abs(r - g) <= ERROR_LIGHT_YELLOW_RG_DIFF):
+            return "yellow"
+        if (b > r * ERROR_LIGHT_BLUE_B_OVER_R
+                and b > g * ERROR_LIGHT_BLUE_B_OVER_G):
+            return "blue"
+        return None
 
     def _flag_error(self, detail: str):
         print(f"[errlight] {detail}")
         self._error_detail = detail
         self._error_flag.set()
 
-    def _error_light_confirmed_dark(self) -> bool:
-        """True once the watcher has seen the error light CONTINUOUSLY dark for longer
-        than a full flash period. At ~1 Hz a single dark sample proves nothing — it can
-        simply have landed between blinks — so this is the evidence needed before a blue
-        ring may be read as "ready" rather than "water error". Any read failure resets
-        the streak: losing sight of the light is not the same as seeing it dark."""
+    def _error_light_confirmed_idle(self) -> bool:
+        """True once the watcher has seen the error light show its idle white
+        CONTINUOUSLY for longer than a full flash period. At ~1 Hz a single white sample
+        proves nothing — a light flashing a fault color spends half its cycle looking
+        white — so this is the evidence needed before a blue RING may be read as "ready"
+        rather than "water error". Any read failure resets the streak: losing sight of
+        the light is not the same as seeing it healthy."""
         if self._error_flag.is_set() or self._error_clear_since is None:
             return False
         return (time.time() - self._error_clear_since) >= RING_READY_CONFIRM_S
@@ -688,8 +724,8 @@ class CycleRunner:
                 resp = str(e)
             if rgb is None:
                 fails += 1
-                # Lost sight of the light — that is not evidence it is dark, so the
-                # "confirmed dark" streak has to start over.
+                # Lost sight of the light — that is not evidence it is healthy, so
+                # the "confirmed idle" streak has to start over.
                 self._error_clear_since = None
                 if resp:
                     reason = resp
@@ -706,18 +742,26 @@ class CycleRunner:
             else:
                 fails = 0
                 r, g, b = rgb
-                if self._error_light_lit(r, g, b):
-                    self._flag_error(f"Error light ON -- R={r} G={g} B={b} "
-                                     f"(sat {max(rgb) - min(rgb)})")
+                color  = self._classify_error_light(r, g, b)
+                if color in ERROR_LIGHT_FAULT_COLORS:
+                    self._flag_error(f"Error light {color.upper()} -- "
+                                     f"R={r} G={g} B={b}")
                     return
+                spread = max(rgb) - min(rgb)
+                if spread > ERROR_LIGHT_WHITE_MAX_SPREAD:
+                    # Saturated but not one of the three fault colors. Not halting on it
+                    # (see _classify_error_light), but it should never happen — log it
+                    # loudly so the thresholds can be tuned against a real reading.
+                    print(f"[errlight] unclassified color R={r} G={g} B={b} "
+                          f"(spread {spread}) -- treating as idle")
                 if self._error_clear_since is None:
-                    self._error_clear_since = time.time()   # dark streak starts here
+                    self._error_clear_since = time.time()   # fault-free streak starts
             stop_flag.wait(ERROR_LIGHT_POLL_S)
 
     def _start_error_watch(self, stop_flag) -> threading.Thread:
         self._error_flag.clear()
         self._error_detail = ""
-        self._error_clear_since = None   # no dark streak until this watcher samples
+        self._error_clear_since = None   # no idle streak until this watcher samples
         t = threading.Thread(target=self._error_light_worker, args=(stop_flag,),
                              daemon=True)
         t.start()
@@ -739,9 +783,9 @@ class CycleRunner:
         """
         Poll for the green brew-complete flash.
         Green  → return immediately so the dispenser can start the next cycle.
-        Blue   → the error light decides. Dark for a confirmed streak means this is the
-                 "time to go" READY ring, so the trigger never took: return "retrigger"
-                 and the caller presses the brew button again. Not yet confirmed dark →
+        Blue   → the error light decides. Idle white for a confirmed streak means this
+                 is the "time to go" READY ring, so the trigger never took: return
+                 "retrigger" and the caller presses the brew button again. Not confirmed →
                  no information, keep polling (a genuinely lit light halts the cycle via
                  the watcher). See the RING_READY_CONFIRM_S notes.
         Orange / yellow → warning: still prompts the operator, as a second net.
@@ -782,16 +826,16 @@ class CycleRunner:
 
             if color == "blue":
                 # Blue alone is ambiguous ("time to go" vs water error). The ERROR LIGHT
-                # breaks the tie: confirmed dark for longer than a full flash period
+                # breaks the tie: confirmed idle white for longer than a flash period
                 # means this is the READY ring, so the machine is sitting at the start of
                 # a cycle and our brew trigger never took. Hand back to _run_one to
                 # press the button again and wait afresh, instead of burning the whole
                 # ring timeout and halting a run that only needed one more pulse.
-                if self._error_light_confirmed_dark():
-                    return "retrigger", (f"ready ring, error light dark "
+                if self._error_light_confirmed_idle():
+                    return "retrigger", (f"ready ring, error light idle "
                                          f"(R={r} G={g} B={b})")
-                # Error light not yet confirmed dark: no information either way, so keep
-                # polling. If it is genuinely lit the watcher halts the cycle anyway.
+                # Not yet confirmed idle: no information either way, so keep polling.
+                # If the light is genuinely faulted the watcher halts the cycle anyway.
                 continue
 
             if color in ("orange", "yellow"):
@@ -861,7 +905,7 @@ class CycleRunner:
     def _check_error_light(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
         """Pre-flight gate: hold here for one full flash period and let the watcher
         decide. The light blinks at ~1 Hz, so a single read proves nothing -- the old
-        one-shot check could pass simply by sampling during a dark half-cycle. Watching
+        one-shot check could pass by sampling the white half of a blink. Watching
         instead of reading also keeps this the only place that talks to the sensor."""
         if not self._step(num, "Watching error light...", status_cb, stop_flag,
                           hold=ERROR_LIGHT_CLEAR_S):
@@ -961,7 +1005,7 @@ class CycleRunner:
         if not self._wait_for_blue(stop_flag, status_cb): return self._abort_reason()
 
         # Trigger the brew, then wait for green. If the ring turns out to be sitting at
-        # "time to go" (ready) with the error light dark, the trigger never took and
+        # "time to go" (ready) with the error light idle white, the trigger never took and
         # _wait_for_ring hands back "retrigger" so we pulse CAP again and wait afresh.
         retriggers = 0
         while True:

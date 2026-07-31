@@ -16,19 +16,27 @@ ring-timing work below. Do not assume selecting 3.0 changes anything today.
 2. The switch was then brought back so 3.0 could ignore blue-ring warnings, because 3.0
    drives the same blue ring for the harmless "time to go" state and for a water error.
 3. Then the **error light** turned out to be the real signal — it goes blue on a water
-   error and is dark unless something is wrong. Error detection moved there wholesale, so
-   ring-blue is now ignored in *both* modes and the 3.0-only branch disappeared.
+   error. Error detection moved there wholesale, so ring-blue no longer warns in *either*
+   mode and the 3.0-only branch disappeared.
+4. Ring blue then became *useful* again rather than merely inert: with the error light
+   confirming "no fault", a blue ring is unambiguously "time to go", which means the brew
+   trigger never took and the cycle re-presses the button instead of timing out.
 
 ## Where errors actually come from now
 
 See the `ERROR_LIGHT_*` block in `coffee_cycler.py`. In short: a daemon thread samples
-`GET COLOR ERROR` for the whole cycle and halts the run the moment the light is lit in any
-color. Detection is a saturation test, because the firmware returns chromaticity (each
-channel divided by clear), so brightness is already normalized out and "lit" means "has a
-color cast" rather than "is bright".
+`GET COLOR ERROR` for the whole cycle and halts the run the moment the light shows a fault
+color. The light is **always on** — its color is the signal. Idle is ~white and healthy;
+**red / yellow / blue** are the faults. Classification runs on chromaticity (the firmware
+divides each channel by clear, so brightness is normalized out), with a neutral-spread
+gate for idle and channel ratios for the three fault colors.
 
-The ring's remaining jobs: the green brew-complete flash, the ring timeout, and the legacy
-orange/yellow operator prompt. Ring blue is inert.
+Behavior and polling are **identical on 2.2.x and 3.0** — nothing in the error-light path
+reads the machine mode, and a test pins that.
+
+The ring's remaining jobs: the green brew-complete flash, the ring timeout, the legacy
+orange/yellow operator prompt, and — with the error light confirming idle — the ready-ring
+re-trigger.
 
 ## The open 3.0 work this switch exists for
 
