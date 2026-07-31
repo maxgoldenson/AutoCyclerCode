@@ -32,9 +32,12 @@ only reproduce under load.
 
 A numpad with no modifiers drives the whole UI. `_pend_items` is the ordered list of
 focusable rows for the current screen — tuples of
-`(kind, widget, var, lo, hi, label)` where `kind` is `entry` / `button` / `checkbox`.
-(A fourth `toggle` kind for a segmented 2.2.x/3.0 switch is written up in
-`docs/machine_mode_3_0.md` — shelved, not in the code.)
+`(kind, widget, var, lo, hi, label)` where `kind` is `entry` / `button` / `checkbox` /
+`toggle`. `toggle` is the segmented Machine (2.2.x / 3.0) switch: its widget is the
+*first* segment button, its var is a `StringVar`, and Enter flips the mode **in place**
+without advancing so the operator sees the selection land. A `toggle` needs branches in
+four places — `_pend_init` (widget-level Enter binding, same branch as `checkbox`),
+`_pend_push_context` (Enter-binding kinds), `_pend_update_indicator`, and `_pend_enter`.
 Order matters: entries first, then `Start` / `Stop` / `Reconnect`, so walking with Enter
 lands on **Start Cycle** and `Reconnect` is last (never hit by accident).
 

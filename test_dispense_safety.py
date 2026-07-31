@@ -21,6 +21,7 @@ SerialDevice via __new__ to skip the boot handshake.
 Run:  python3 test_dispense_safety.py
 """
 import sys
+import time
 import types
 import threading
 
@@ -314,7 +315,10 @@ def test_skip_dispense_off_by_default_still_dispenses():
     print("PASS: skip dispense defaults off -> cycle still dispenses once")
 
 
-# --- machine-mode (2.2.x vs 3.0) op order -----------------------------------
+# --- machine mode (2.2.x vs 3.0) --------------------------------------------
+# Both modes run the SAME op order. The only difference is that 3.0 ignores a blue
+# ring, because on that machine blue is used for BOTH the "time to go" ready ring and
+# the water-error ring and the fixture can't yet tell them apart.
 def _run_logged_cycle(machine: str):
     """One full cycle with BOTH fake boards appending commands to one chronological
     list, so cross-board op order can be asserted."""
@@ -355,22 +359,60 @@ def test_mode_22_order_error_dispense_door_cap():
     print("PASS: 2.2.x order -- error check, dispense, door open/close, cap")
 
 
-def test_mode_30_order_dispense_door_error_cap():
-    ok, msg, ev = _run_logged_cycle("3.0")
-    assert ok, msg
-    order = [_first_index(ev, "SET ANGLE"),
-             _first_index(ev, f"SET SERVO {cc.SERVO_OPEN}"),
-             _first_index(ev, f"SET SERVO {cc.SERVO_REST}"),
-             _first_index(ev, "GET COLOR ERROR"),
-             _first_index(ev, "SET CAP ON")]
-    assert order == sorted(order), (order, ev)
-    print("PASS: 3.0 order -- dispense, door open/close, error check, cap")
+def test_mode_30_runs_the_same_op_order_as_22():
+    """3.0 must NOT reorder the cycle -- it cycles exactly like 2.2.x."""
+    _ok22, msg22, ev22 = _run_logged_cycle("2.2")
+    _ok30, msg30, ev30 = _run_logged_cycle("3.0")
+    assert _ok22 and _ok30, (msg22, msg30)
+    assert ev22 == ev30, (ev22, ev30)
+    print("PASS: 3.0 runs the same command sequence as 2.2.x")
 
 
 def test_machine_mode_defaults_to_22():
     dm_probe = types.SimpleNamespace(dispenser=None, front=None)
-    assert cc.CycleRunner(dm_probe, 0, 5, None).machine == "2.2"
-    print("PASS: machine mode defaults to 2.2.x")
+    runner = cc.CycleRunner(dm_probe, 0, 5, None)
+    assert runner.machine == "2.2"
+    assert runner.ignore_blue_ring is False
+    print("PASS: machine mode defaults to 2.2.x (blue ring still warns)")
+
+
+# --- 3.0 ignores blue rings -------------------------------------------------
+def _blue_ring_outcome(machine: str):
+    """_wait_for_ring against a ring that reads BLUE forever (never green)."""
+    front = _make_device(lambda _cmd: [b"RGB:10,10,220\n"])
+    dm    = types.SimpleNamespace(dispenser=None, front=front)
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=1,
+                            ring_warning_cb=lambda _c, _d: "resume",
+                            machine=machine)
+    return runner._wait_for_ring(time.time(), threading.Event(),
+                                 lambda _n, _lbl: None)
+
+
+def test_mode_22_blue_ring_still_warns():
+    outcome, detail = _blue_ring_outcome("2.2")
+    assert outcome == "warning:blue", (outcome, detail)
+    print("PASS: 2.2.x -- blue before green still raises the ring warning")
+
+
+def test_mode_30_blue_ring_ignored():
+    """On 3.0 a blue ring is ambiguous, so it must not raise a warning. A brew that
+    never happens still halts the run, via the ring timeout."""
+    outcome, detail = _blue_ring_outcome("3.0")
+    assert outcome == "timeout", (outcome, detail)
+    print("PASS: 3.0 -- blue ring ignored, only the timeout halts the run")
+
+
+def test_mode_30_blue_ring_does_not_block_green():
+    """Ignoring blue must not swallow the green flash that follows it."""
+    reads = [b"RGB:10,10,220\n", b"RGB:10,10,220\n", b"RGB:10,220,10\n"]
+    front = _make_device(lambda _cmd: [reads.pop(0)] if reads else [b"RGB:10,220,10\n"])
+    dm    = types.SimpleNamespace(dispenser=None, front=front)
+    runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=5,
+                            ring_warning_cb=lambda _c, _d: "resume", machine="3.0")
+    outcome, detail = runner._wait_for_ring(time.time(), threading.Event(),
+                                            lambda _n, _lbl: None)
+    assert outcome == "green", (outcome, detail)
+    print("PASS: 3.0 -- green after blue is still detected")
 
 
 def test_ring_timeout_stops_run_as_error():
@@ -476,8 +518,11 @@ if __name__ == "__main__":
         test_skip_dispense_never_commands_dispenser,
         test_skip_dispense_off_by_default_still_dispenses,
         test_mode_22_order_error_dispense_door_cap,
-        test_mode_30_order_dispense_door_error_cap,
+        test_mode_30_runs_the_same_op_order_as_22,
         test_machine_mode_defaults_to_22,
+        test_mode_22_blue_ring_still_warns,
+        test_mode_30_blue_ring_ignored,
+        test_mode_30_blue_ring_does_not_block_green,
         test_ring_timeout_stops_run_as_error,
         test_send_still_retries_idempotent_commands,
         test_send_returns_on_first_match,

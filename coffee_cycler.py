@@ -5,7 +5,7 @@ Tkinter GUI for running automated brew cycles over serial.
 Devices are auto-discovered by their WHO AM I response and the
 COM port assignments are persisted to autocycler_config.json.
 
-Cycle sequence per brew (machine 2.2.x -- the only order the app can run):
+Cycle sequence per brew (identical for both machine modes):
   1. GET COLOR ERROR  -- abort if error light is red/orange/yellow
   2. SET ANGLE 360    -- dispense ~19 g
   3. Servo OPEN -> 3 s -> CLOSE
@@ -15,8 +15,9 @@ Cycle sequence per brew (machine 2.2.x -- the only order the app can run):
      * Warning color -> pause and prompt user (resume / reset / stop)
      * Timeout       -> assume the brew failed: halt the run as an error
 
-CycleRunner also carries an unconfirmed 3.0 op order (machine="3.0"), but it has
-NO UI selector and nothing in the app sets it -- see docs/machine_mode_3_0.md.
+The Machine switch (2.2.x / 3.0) in the CONFIGURATION panel selects the machine
+under test. Both modes run the op order above; the only difference is that 3.0
+never raises a BLUE ring warning -- see CycleRunner.ignore_blue_ring.
 
 Numpad pendant controls (always active):
   8 / 2       navigate up / down between fields
@@ -56,7 +57,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-27 12:35"
+VERSION = "2026-07-31 17:15"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -519,12 +520,22 @@ class CycleRunner:
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
         self.skip_dispense   = skip_dispense
-        # "2.2" is the only order the app can select today. "3.0" is implemented and
-        # tested but deliberately unreachable -- see docs/machine_mode_3_0.md.
+        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. Both modes
+        # run the SAME op order; 3.0 only changes how a blue ring is treated.
         self.machine         = machine
         self._green_seen  = False
         self._cycle_count = 0
         self._green_times: list = []  # wall-clock timestamps of each green flash
+
+    @property
+    def ignore_blue_ring(self) -> bool:
+        """3.0 only: the machine drives the SAME blue ring for two different states --
+        the "time to go" ready ring and the water-error ring -- and the fixture cannot
+        tell them apart yet. Treating that read as a failure would stop good runs on a
+        ring that means the machine is fine, so 3.0 never warns on blue and keeps
+        polling for green. A brew that genuinely never happens still halts the run via
+        the ring timeout. Remove this once blue is split by timing / classification."""
+        return self.machine == "3.0"
 
     @property
     def mean_cycle_s(self) -> float:
@@ -576,7 +587,9 @@ class CycleRunner:
         """
         Poll for the green brew-complete flash.
         Green  → return immediately so the dispenser can start the next cycle.
-        Blue before green → always a warning (machine idle without having brewed).
+        Blue before green → a warning on 2.2.x (machine idle without having brewed);
+                            ignored on 3.0, where blue is ambiguous — see
+                            ignore_blue_ring.
         Orange / yellow   → warning.
         Timeout           → no green seen: the caller halts the run as an error.
         """
@@ -611,7 +624,12 @@ class CycleRunner:
                 return "green", f"R={r} G={g} B={b}"
 
             if color == "blue":
-                # Blue before green always means the machine didn't brew
+                if self.ignore_blue_ring:
+                    # 3.0: blue can be the harmless "time to go" ring, so it is not
+                    # evidence the machine failed to brew. Keep polling for green.
+                    print("[ring]   blue ignored (machine 3.0)")
+                    continue
+                # 2.2.x: blue before green always means the machine didn't brew
                 return "warning:blue", f"Blue ring before green (R={r} G={g} B={b})"
 
             if color in ("orange", "yellow"):
@@ -739,16 +757,11 @@ class CycleRunner:
         # Guarantee CAP is high-impedance at the start of every cycle
         f.send("SET CAP OFF", expect="CAP:")
 
-        if self.machine == "3.0":
-            # 3.0 (UNCONFIRMED, no UI selector -- docs/machine_mode_3_0.md): deliver the
-            # dose as soon as possible after the previous green flash -- dispense (lands
-            # on the closed door), cycle the door, and only then run the pre-brew error
-            # check. The error check runs AFTER the dispense here, so an errored machine
-            # costs one staged dose before the abort.
-            order = (self._dispense_step, self._door_cycle, self._check_error_light)
-        else:
-            # 2.2.x: legacy order -- pre-flight error check, dispense, door cycle.
-            order = (self._check_error_light, self._dispense_step, self._door_cycle)
+        # Both machine modes run this order: pre-flight error check, dispense, door
+        # cycle. 3.0 deliberately does NOT reorder the ops -- the only 3.0 difference is
+        # that a blue ring never raises a warning (see ignore_blue_ring). The ops stay
+        # extracted so a confirmed 3.0 order can be swapped in here later.
+        order = (self._check_error_light, self._dispense_step, self._door_cycle)
         for num, op in enumerate(order, start=1):
             early_exit = op(num, stop_flag, status_cb)
             if early_exit is not None:
@@ -924,6 +937,9 @@ class CoffeeCyclerApp:
         self.maint_interval_var = tk.IntVar(value=50)
         # Default OFF: the dispenser runs every cycle unless the user opts out.
         self.skip_dispense_var  = tk.BooleanVar(value=False)
+        # Machine under test ("2.2" or "3.0"). Persisted in the config file so an OTA
+        # restart / reboot can't silently revert the selection mid-campaign.
+        self.machine_mode_var   = tk.StringVar(value=self._load_machine_mode())
         self.current_cycle    = 0
         self.cycle_thread: Optional[threading.Thread] = None
         self._starting        = False   # guards against re-entrant / double Start
@@ -941,8 +957,9 @@ class CoffeeCyclerApp:
         self._pend_labels: dict = {}           # idx → tk.Label whose fg turns green when focused
         self._pend_rest_fg: dict = {}          # idx → fg when NOT focused (default MUTED)
         # Items: (kind, widget, var, lo, hi, label)
-        #   kind  'entry' | 'button' | 'checkbox'
+        #   kind  'entry' | 'button' | 'checkbox' | 'toggle'
         #   var   IntVar (entry) | None (button) | BooleanVar (checkbox)
+        #         | StringVar (toggle)
         #   lo/hi int bounds for entry, None otherwise
         self._pend_items:   list  = []
         self._pend_idx:     int   = 0
@@ -956,6 +973,57 @@ class CoffeeCyclerApp:
         self._build_ui()
         self._tick()
         self._start_discovery()
+
+    # -------------------------------------------------------------------------
+    #  Machine mode (2.2.x / 3.0)
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _load_machine_mode() -> str:
+        """Restore the persisted machine mode; anything unexpected -> safe "2.2"."""
+        try:
+            with open(CONFIG_FILE) as fh:
+                if json.load(fh).get("machine_mode") == "3.0":
+                    return "3.0"
+        except Exception:
+            pass
+        return "2.2"
+
+    @staticmethod
+    def _save_machine_mode(mode: str):
+        cfg = {}
+        try:
+            with open(CONFIG_FILE) as fh:
+                cfg = json.load(fh)   # preserve the saved COM-port assignments
+        except Exception:
+            pass
+        cfg["machine_mode"] = mode
+        try:
+            with open(CONFIG_FILE, "w") as fh:
+                json.dump(cfg, fh, indent=2)
+        except Exception as e:
+            print(f"[config] machine mode save failed: {e}")
+
+    def _set_machine_mode(self, mode: str):
+        if str(self.machine_22_btn.cget("state")) == "disabled":
+            return   # locked while a run is active
+        self.machine_mode_var.set(mode)
+        self._style_machine_switch()
+        self._save_machine_mode(mode)
+        self._pend_update_indicator()
+
+    def _style_machine_switch(self):
+        sel = self.machine_mode_var.get()
+        for btn, mode in ((self.machine_22_btn, "2.2"), (self.machine_30_btn, "3.0")):
+            active = (mode == sel)
+            btn.configure(bg=self.ACCENT if active else self.PANEL,
+                          fg="#FFFFFF"   if active else self.MUTED,
+                          activebackground=self.ACCENT if active else self.PANEL,
+                          activeforeground="#FFFFFF"   if active else self.TEXT)
+        # 3.0 suppresses blue-ring warnings, which is invisible until a blue ring shows
+        # up mid-run. Say so on screen so nobody debugs a "missing" warning later.
+        self.machine_note.configure(
+            text=("blue ring warnings ignored" if sel == "3.0" else ""),
+            fg=self.WARNING)
 
     # -------------------------------------------------------------------------
     #  Window / styles
@@ -1118,8 +1186,30 @@ class CoffeeCyclerApp:
         self.skip_dispense_var.trace_add("write",
                                          lambda *_a: self._on_skip_dispense_toggle())
 
-        # NOTE: a machine-mode (2.2.x / 3.0) selector belongs here when that feature is
-        # switched on -- see docs/machine_mode_3_0.md for the shelved design.
+        # Machine under test. Segmented switch rather than a checkbox: the two machines
+        # are peers, and naming both makes the inactive option readable at a glance.
+        mode_row = tk.Frame(grid_cfg, bg=self.PANEL)
+        mode_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.machine_lbl = tk.Label(mode_row, text="Machine", bg=self.PANEL,
+                                    fg=self.MUTED, font=("Helvetica", 11))
+        self.machine_lbl.pack(side="left")
+        self._pend_labels[5] = self.machine_lbl   # turns green when pendant-focused
+        seg = tk.Frame(mode_row, bg=self.BORDER)
+        seg.pack(side="left", padx=(16, 0))
+        def _mode_segment(text, mode):
+            return tk.Button(seg, text=text, bd=0, relief="flat", width=7,
+                             font=("Helvetica", 12, "bold"), cursor="hand2",
+                             highlightthickness=0, pady=6,
+                             disabledforeground=self.BORDER,
+                             command=lambda: self._set_machine_mode(mode))
+        self.machine_22_btn = _mode_segment("2.2.x", "2.2")
+        self.machine_30_btn = _mode_segment("3.0",   "3.0")
+        self.machine_22_btn.pack(side="left", padx=(1, 0), pady=1)
+        self.machine_30_btn.pack(side="left", padx=1,      pady=1)
+        self.machine_note = tk.Label(mode_row, text="", bg=self.PANEL, fg=self.WARNING,
+                                     font=("Helvetica", 11))
+        self.machine_note.pack(side="left", padx=(16, 0))
+        self._style_machine_switch()
 
         # ── Pendant indicator ────────────────────────────────────────────────
         pend = self._panel(outer)
@@ -1206,9 +1296,10 @@ class CoffeeCyclerApp:
     #  Numpad pendant
     # =========================================================================
     # Item tuple: (kind, widget, var, lo, hi, label)
-    #   'entry'    ttk.Entry   IntVar  int   int   str
-    #   'button'   ttk.Button  None    None  None  str
-    #   'checkbox' Checkbutton BoolVar None  None  str
+    #   'entry'    ttk.Entry   IntVar   int   int   str
+    #   'button'   ttk.Button  None     None  None  str
+    #   'checkbox' Checkbutton BoolVar  None  None  str
+    #   'toggle'   tk.Button   StringVar None None  str   (machine-mode segment)
 
     # Keysym → method for keys that are ALWAYS pendant actions (never type a character).
     # Both KP_ variants (standard) and plain keysym variants (some Windows configs) included.
@@ -1240,6 +1331,7 @@ class CoffeeCyclerApp:
             ("entry",    self.ring_timeout_entry, self.ring_timeout_var,   30,  600, "Ring timeout (s)"),
             ("entry",    self.maint_entry,        self.maint_interval_var, 1,   999, "Maintenance interval"),
             ("checkbox", self.skip_dispense_cb,   self.skip_dispense_var,  None, None, "Skip dispense"),
+            ("toggle",   self.machine_22_btn,     self.machine_mode_var,   None, None, "Machine"),
             ("button",   self.start_btn,          None, None, None, "Start Cycle"),
             ("button",   self.stop_btn,           None, None, None, "Stop"),
             ("button",   self.reconnect_btn,      None, None, None, "Reconnect"),
@@ -1254,9 +1346,9 @@ class CoffeeCyclerApp:
                 # <Key> guard fires BEFORE the Entry class binding that inserts chars.
                 # It also catches char-based variants (e.g. 'slash' vs 'KP_Divide').
                 widget.bind("<Key>", self._pend_key_guard)
-            elif kind == "checkbox":
-                # Widget-level Enter runs the pendant handler BEFORE the Checkbutton
-                # class binding and breaks — otherwise Enter would double-toggle.
+            elif kind in ("checkbox", "toggle"):
+                # Widget-level Enter runs the pendant handler BEFORE the Checkbutton /
+                # Button class binding and breaks — otherwise Enter would double-toggle.
                 widget.bind("<KP_Enter>", self._pend_enter)
                 widget.bind("<Return>",   self._pend_enter)
             widget.bind("<FocusIn>", lambda _e, idx=i: self._on_widget_focus(idx))
@@ -1298,7 +1390,7 @@ class CoffeeCyclerApp:
         # handler fires BEFORE the Checkbutton/Button class binding (which would
         # toggle the widget independently and cause a double-action).
         for i, (kind, widget, *_) in enumerate(items):
-            if kind in ('checkbox', 'button'):
+            if kind in ('checkbox', 'toggle', 'button'):
                 widget.bind('<KP_Enter>', self._pend_enter)
                 widget.bind('<Return>',   self._pend_enter)
             widget.bind('<KP_Decimal>',  self._pend_down)
@@ -1375,6 +1467,10 @@ class CoffeeCyclerApp:
             checked = "checked" if (_var and _var.get()) else "unchecked"
             self._pend_focus_var.set(f">>  {label}  [{checked}]")
             self._pend_hint_var.set("Enter to toggle and advance")
+        elif kind == "toggle":
+            mode = "3.0" if (_var and _var.get() == "3.0") else "2.2.x"
+            self._pend_focus_var.set(f">>  {label}  [{mode}]")
+            self._pend_hint_var.set("Enter to switch machine mode")
 
     # -- key handlers ---------------------------------------------------------
 
@@ -1446,6 +1542,10 @@ class CoffeeCyclerApp:
             if var is not None: var.set(not var.get())
             self._pend_move(1)
             self._pend_update_indicator()
+
+        elif kind == "toggle":
+            # Flip in place (no advance) so the operator sees the selection land.
+            self._set_machine_mode("3.0" if var.get() == "2.2" else "2.2")
 
         return "break"
 
@@ -1573,13 +1673,15 @@ class CoffeeCyclerApp:
                 return
 
             skip_dispense = bool(self.skip_dispense_var.get())
+            machine       = self.machine_mode_var.get()
 
             if not self._show_prestart_dialog():
                 return
 
             for w in (self.cycles_entry, self.ring_min_entry,
                       self.ring_timeout_entry, self.maint_entry,
-                      self.skip_dispense_cb):
+                      self.skip_dispense_cb,
+                      self.machine_22_btn, self.machine_30_btn):
                 w.configure(state="disabled")
             self.start_btn.configure(state="disabled")
             self.reconnect_btn.configure(state="disabled")
@@ -1595,7 +1697,8 @@ class CoffeeCyclerApp:
                                  # check can't slip in between start and the first tick
             self.cycle_thread = threading.Thread(
                 target=self._run_cycles,
-                args=(n, ring_wait_min, ring_timeout, maint_interval, skip_dispense),
+                args=(n, ring_wait_min, ring_timeout, maint_interval, skip_dispense,
+                      machine),
                 daemon=True,
             )
             self.cycle_thread.start()
@@ -1964,8 +2067,10 @@ class CoffeeCyclerApp:
         self._clear_busy()       # run finished -> let the OTA launcher resume updates
         for w in (self.cycles_entry, self.ring_min_entry,
                   self.ring_timeout_entry, self.maint_entry,
-                  self.skip_dispense_cb):
+                  self.skip_dispense_cb,
+                  self.machine_22_btn, self.machine_30_btn):
             w.configure(state="normal")
+        self._style_machine_switch()   # re-enabling resets the segment colors
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.reconnect_btn.configure(state="normal")

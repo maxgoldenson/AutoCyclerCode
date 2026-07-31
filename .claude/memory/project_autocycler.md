@@ -34,16 +34,22 @@ OPEN** (`SERVO_OPEN`): the app opens the gate on connect (`_discovery_worker`) a
 clean run end / user stop (`_on_finished` → `_set_idle_gate`). NOT opened on `_on_error`
 (the board may be in an unknown state).
 
-**Cycle sequence** (2.2.x order — the only one the app can run):
+**Cycle sequence** (identical in both machine modes):
 GET COLOR ERROR (abort if red) → SET ANGLE 360 (~19 g) → servo OPEN → 3 s → REST
 → wait blue ring → CAP ON pulse → poll for green flash.
 - Green-flash timeout (`ring_timeout`, default 120 s) halts the run as an ERROR
   (red status + ntfy alert); it no longer proceeds to the next cycle.
-- A 3.0 op order exists in `CycleRunner(machine="3.0")` (dispense → door → error check)
-  but is **deliberately unreachable — no UI selector, nothing sets it**. Shelved pending
-  confirmation against a real machine: `docs/machine_mode_3_0.md`.
 
-**Config persistence:** `autocycler_config.json` in project root saves discovered COM port assignments.
+**Machine mode (2.2.x / 3.0):** segmented switch in the CONFIGURATION panel, pendant item
+5 (kind `toggle`), persisted as `machine_mode`. It does **not** reorder the cycle — the
+only difference is `CycleRunner.ignore_blue_ring`: on 3.0 a blue ring while waiting for
+green never warns, because 3.0 uses the same blue for the harmless "time to go" ring and
+the water-error ring and the fixture can't yet tell them apart. Stopgap until blue is
+split by timing. Details + the shelved op-reorder: `docs/machine_mode_3_0.md`.
+
+**Config persistence:** `autocycler_config.json` in project root saves discovered COM port
+assignments plus app-level keys (`machine_mode`); `DeviceManager._save_config` re-reads
+before writing so a port re-discovery never wipes them.
 
 **OTA / fleet (launcher.py):** The Pi polls `main` and auto-updates `coffee_cycler.py`
 (gated on file md5) and the ESP32 firmware. Firmware flashing is gated on each sketch's
