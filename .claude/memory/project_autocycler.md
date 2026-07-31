@@ -70,6 +70,15 @@ meant to show those four states, so it means the thresholds need tuning). Tune f
   `_do_cap_reset` — both reachable only from a requested run. The GUI never asserts CAP.
   A test pins this: the cycler must never brew when it wasn't asked to.
 
+⭐ **Both color sensors share I2C address 0x29** — only the PCA9548A mux tells them apart,
+so a mux on the wrong channel silently returns the WRONG sensor's color (the error light
+appearing to show a ring color → phantom water error, or a hidden fault). Guards:
+firmware reads the mux control register back after switching (`muxSelect`), and every
+color read asks `GET COLOR <sensor> TAG` so the reply names its source; `_parse_rgb`
+discards a reply tagged with a different sensor. If the ERROR channel ever reads *green*
+the log says so loudly — the error light has no green state, so that means the
+`MUX_CH_RING`/`MUX_CH_ERROR` assignment is swapped relative to the wiring.
+
 **Door cover is hot-pluggable:** it carries the I2C mux AND both color sensors, so the
 whole chain can vanish/return at any time. `AUTOCYCLER_FRONT.ino` re-establishes it on
 every color read (`ensureSensor`), re-initializing only what's actually missing rather

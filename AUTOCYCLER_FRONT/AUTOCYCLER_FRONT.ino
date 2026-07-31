@@ -7,6 +7,9 @@
  *  GET COLOR RING         → RGB:<r>,<g>,<b>   (Ring sensor,  MUX ch 0)
  *  GET COLOR ERROR LED    → RGB:...  (keeps LED on after read)
  *  GET COLOR RING  LED    → RGB:...  (keeps LED on after read)
+ *  GET COLOR <s> TAG      → RGB:<SENSOR>:<r>,<g>,<b>  (names the sensor it read;
+ *                           both sensors share address 0x29, so the tag is the only
+ *                           way a host can prove which one answered)
  *
  *  SET SERVO <0-180>      → SERVO:<angle>
  *  SET CAP ON             → CAP:ON
@@ -43,7 +46,7 @@
 // ── Firmware version ───────────────────────────────────────────────────────────
 // The launcher flashes the board ONLY when this string changes — so editing comments
 // or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
-#define FW_VERSION "2026-07-31.1"
+#define FW_VERSION "2026-07-31.2"
 
 // ── MUX config ─────────────────────────────────────────────────────────────────
 #define PCA9548A_ADDR 0x70
@@ -118,12 +121,28 @@ bool i2cRead8(uint8_t addr, uint8_t reg, uint8_t &val) {
   return true;
 }
 
-// Point the mux at one channel. Returns false if the mux itself doesn't ACK, which
-// means the cover is unplugged (or the bus is wedged — see i2cRecover).
+// Read the PCA9548A control register (a bare 1-byte read — no register address).
+bool muxReadback(uint8_t &val) {
+  if (Wire.requestFrom((uint8_t)PCA9548A_ADDR, (uint8_t)1) != 1) return false;
+  val = Wire.read();
+  return true;
+}
+
+// Point the mux at exactly one channel and PROVE it landed there.
+//
+// An ACKed write is not proof the switch actually latched, and both sensors are
+// TCS34725s at the same address 0x29 — the mux is the ONLY thing that distinguishes
+// them. So a mux left on the wrong channel doesn't fail loudly: it silently answers
+// with the OTHER sensor's reading, i.e. the error light appearing to show a ring
+// color. Reading the control register back makes that impossible to miss.
 bool muxSelect(uint8_t ch) {
+  const uint8_t want = (uint8_t)(1 << ch);
   Wire.beginTransmission(PCA9548A_ADDR);
-  Wire.write(1 << ch);
-  return Wire.endTransmission() == 0;
+  Wire.write(want);
+  if (Wire.endTransmission() != 0) return false;
+  uint8_t got = 0;
+  if (!muxReadback(got)) return false;
+  return got == want;   // exactly one channel, and it is the one asked for
 }
 
 // Unwedge the bus. A cover pulled mid-transfer can leave a device holding SDA low,
@@ -222,28 +241,38 @@ void handleGetVersion() {
 }
 
 void handleGetColor(const String &args) {
-  // Syntax: GET COLOR [ERROR|RING] [LED]
+  // Syntax: GET COLOR [ERROR|RING] [LED] [TAG]
   // Sensor defaults to ERROR for backward compatibility.
+  //
+  // TAG makes the reply name the sensor it came from: RGB:<SENSOR>:<r>,<g>,<b>. Both
+  // sensors are TCS34725s at the same address, so without a tag a reading is only as
+  // trustworthy as the mux, and a host has no way to tell an error-light reading from a
+  // ring reading. Tagging is OPT-IN precisely so the two ends can update independently:
+  //   new host + old firmware -> "TAG" falls into the ignored tail, reply is untagged
+  //   old host + new firmware -> no TAG asked for, reply is untagged
+  // Either way nothing breaks during the window where app and firmware differ.
   String upper = args;
   upper.toUpperCase();
   upper.trim();
 
   uint8_t channel = MUX_CH_ERROR;
-  bool ledArg = false;
+  const char *sensorName = "ERROR";
+  String tail;
 
   if (upper.startsWith("RING")) {
     channel = MUX_CH_RING;
-    String tail = upper.substring(4);
-    tail.trim();
-    ledArg = (tail == "LED");
+    sensorName = "RING";
+    tail = upper.substring(4);
   } else if (upper.startsWith("ERROR")) {
     channel = MUX_CH_ERROR;
-    String tail = upper.substring(5);
-    tail.trim();
-    ledArg = (tail == "LED");
+    sensorName = "ERROR";
+    tail = upper.substring(5);
   } else {
-    ledArg = (upper == "LED");
+    tail = upper;
   }
+  tail.trim();
+  bool ledArg = (tail.indexOf("LED") >= 0);
+  bool tagArg = (tail.indexOf("TAG") >= 0);
 
   digitalWrite(LED_PIN, HIGH);
   delay(60);
@@ -252,6 +281,10 @@ void handleGetColor(const String &args) {
   const char *err = readColor(channel, r, g, b);
   if (err == nullptr) {
     Serial.print("RGB:");
+    if (tagArg) {
+      Serial.print(sensorName);   // RGB:ERROR:... / RGB:RING:...
+      Serial.print(":");
+    }
     Serial.print(r);
     Serial.print(",");
     Serial.print(g);

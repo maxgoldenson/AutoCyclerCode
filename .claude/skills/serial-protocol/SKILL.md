@@ -45,6 +45,20 @@ if resp.startswith("RGB:"):
     r, g, b = (int(x) for x in resp[4:].split(","))
 ```
 
+**⭐ `TAG` — prove which sensor answered.** Both color sensors are TCS34725s at the *same*
+I2C address (0x29); only the mux distinguishes them. So an untagged `RGB:` reading is
+exactly as trustworthy as the mux, and a mux stuck on the wrong channel doesn't fail
+loudly — it silently returns the *other* sensor's color. That reads as the error light
+showing a ring color: a blue ring becomes a phantom water error that halts a healthy run,
+or hides a real fault. Every color read therefore sends `GET COLOR <sensor> TAG` and
+parses via `_parse_rgb(resp, sensor)`, which **discards a reply tagged with a different
+sensor**. The firmware also reads the PCA9548A control register back after switching, so
+a mux that didn't latch is an error rather than a wrong answer.
+
+`TAG` is opt-in so both ends can update independently: a new host against old firmware
+gets untagged replies (still accepted), and old host against new firmware never asks for
+the tag. Neither direction breaks during an app/firmware version skew.
+
 **`accept=` — prefixes that are an ANSWER, not noise.** By default anything that isn't
 `expect` is discarded and the whole command is retried. That's right for line noise, but
 wrong for a typed reply that definitively answers the question: a board saying

@@ -440,6 +440,57 @@ def test_error_light_classifies_fault_colors_not_brightness():
     print("PASS: error light classifies red/yellow/blue as faults, white as idle")
 
 
+def test_rgb_reply_must_come_from_the_sensor_we_asked_for():
+    """Both sensors are TCS34725s at the SAME I2C address -- only the mux tells them
+    apart -- so an untagged reading is exactly as trustworthy as the mux. A tagged reply
+    naming a different sensor must be discarded: acting on the ring's color while
+    believing it is the error light is how a blue ring becomes a phantom water error."""
+    assert cc._parse_rgb("RGB:94,86,255", "ERROR") == (94, 86, 255), "untagged still OK"
+    assert cc._parse_rgb("RGB:ERROR:94,86,255", "ERROR") == (94, 86, 255)
+    assert cc._parse_rgb("RGB:RING:94,86,255", "RING") == (94, 86, 255)
+    # The failure this whole audit is about:
+    assert cc._parse_rgb("RGB:RING:94,86,255", "ERROR") is None, \
+        "a RING reading must never be accepted as an ERROR reading"
+    assert cc._parse_rgb("RGB:ERROR:10,10,220", "RING") is None
+    assert cc._parse_rgb("ERROR:door cover not detected", "ERROR") is None
+    assert cc._parse_rgb("", "ERROR") is None
+    assert cc._parse_rgb("RGB:bogus", "ERROR") is None
+    print("PASS: a reading tagged with the wrong sensor is discarded, untagged still works")
+
+
+def test_color_reads_ask_for_a_sensor_tag():
+    """Every color read must request TAG, or the verification above can't fire."""
+    import inspect
+    for name in ("_wait_for_blue", "_wait_for_ring", "_error_light_worker"):
+        src = inspect.getsource(getattr(cc.CycleRunner, name))
+        assert "GET COLOR" in src
+        for line in src.splitlines():
+            if "GET COLOR" in line and "send(" in line:
+                assert "TAG" in line, f"{name}: untagged color read: {line.strip()}"
+    print("PASS: every color read asks the board to name the sensor it read")
+
+
+def test_wrong_sensor_reply_halts_rather_than_being_believed():
+    """End to end: a board answering with the RING's blue while we asked for the error
+    light must NOT be read as a water error. The reading is discarded, and since the
+    error light is the only fault detector, the run halts as unreadable instead."""
+    class SwappedFront(FrontBoard):
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                return [b"RGB:RING:94,86,255\n"]      # mux stuck on the ring channel
+            return super().__call__(cmd)
+    saved = cc.ERROR_LIGHT_MAX_FAILS
+    cc.ERROR_LIGHT_MAX_FAILS = 3
+    try:
+        ok, msg = _run_cycle_with_front(SwappedFront())
+    finally:
+        cc.ERROR_LIGHT_MAX_FAILS = saved
+    assert not ok, msg
+    assert "unreadable" in msg, msg
+    assert "BLUE" not in msg, f"a ring reading must not become a water-error halt: {msg}"
+    print("PASS: a wrong-sensor reply halts as unreadable, never as a phantom fault")
+
+
 def test_error_light_is_identical_in_both_modes():
     """The error light must behave the same on 2.2.x and 3.0 -- nothing in its path may
     branch on the machine mode."""
@@ -762,6 +813,9 @@ if __name__ == "__main__":
         test_orange_ring_still_prompts_the_operator,
         test_error_light_classifies_fault_colors_not_brightness,
         test_error_light_is_identical_in_both_modes,
+        test_rgb_reply_must_come_from_the_sensor_we_asked_for,
+        test_color_reads_ask_for_a_sensor_tag,
+        test_wrong_sensor_reply_halts_rather_than_being_believed,
         test_error_light_halts_the_run,
         test_error_light_clear_lets_the_cycle_finish,
         test_ready_ring_asks_for_a_retrigger,

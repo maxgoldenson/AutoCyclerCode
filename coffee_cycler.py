@@ -72,7 +72,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 20:53"
+VERSION = "2026-07-31 21:20"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -587,6 +587,37 @@ def _sleep(seconds: float, stop_flag: threading.Event) -> bool:
     return True
 
 
+def _parse_rgb(resp: str, sensor: str) -> Optional[tuple]:
+    """Parse an `RGB:` reply, VERIFYING which sensor it came from. -> (r,g,b) or None.
+
+    Both color sensors are TCS34725s at the same I2C address; only the mux tells them
+    apart. So an untagged reading is exactly as trustworthy as the mux, and a mux stuck
+    on the wrong channel would hand back the ring's color while the host believed it was
+    reading the error light -- a blue ring then reads as a blue (water-error) light and
+    halts a healthy run, or hides a real fault.
+
+    Firmware built after 2026-07-31.2 answers `RGB:<SENSOR>:<r>,<g>,<b>` when asked with
+    the TAG argument. A tag naming a DIFFERENT sensor than the caller asked for is
+    rejected outright -- that reading must never be acted on. An untagged reply is still
+    accepted, so a Pi running a newer app against not-yet-flashed firmware keeps working.
+    """
+    if not resp.startswith("RGB:"):
+        return None
+    body = resp[4:]
+    if ":" in body:
+        tag, _, body = body.partition(":")
+        got = tag.strip().upper()
+        if got != sensor.upper():
+            print(f"[serial] SENSOR MISMATCH: asked for {sensor}, board answered {got} "
+                  f"-- discarding this reading (mux/channel fault)")
+            return None
+    try:
+        r, g, b = (int(x) for x in body.split(","))
+    except ValueError:
+        return None
+    return r, g, b
+
+
 class CycleRunner:
     TOTAL_STEPS = 5
 
@@ -633,16 +664,14 @@ class CycleRunner:
             if stop_flag.is_set() or self._error_flag.is_set():
                 return False
             status_cb(4, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
-            resp = f.send("GET COLOR RING", expect="RGB:", accept=("ERROR:",))
-            if resp.startswith("RGB:"):
-                try:
-                    r, g, b = (int(x) for x in resp[4:].split(","))
-                    color = self._classify_ring_color(r, g, b)
-                    print(f"[blue-wait] R={r} G={g} B={b} -> {color}")
-                    if color == "blue":
-                        return True
-                except ValueError:
-                    pass
+            resp = f.send("GET COLOR RING TAG", expect="RGB:", accept=("ERROR:",))
+            rgb = _parse_rgb(resp, "RING")
+            if rgb is not None:
+                r, g, b = rgb
+                color = self._classify_ring_color(r, g, b)
+                print(f"[blue-wait] R={r} G={g} B={b} -> {color}")
+                if color == "blue":
+                    return True
         print(f"[blue-wait] no blue after {timeout}s, proceeding")
         return True
 
@@ -713,10 +742,10 @@ class CycleRunner:
             rgb  = None
             resp = ""
             try:
-                resp = f.send("GET COLOR ERROR", expect="RGB:",
+                resp = f.send("GET COLOR ERROR TAG", expect="RGB:",
                               accept=("ERROR:",))
-                if resp.startswith("RGB:"):
-                    rgb = tuple(int(x) for x in resp[4:].split(","))
+                # Verifies the board answered for the ERROR sensor, not the ring.
+                rgb = _parse_rgb(resp, "ERROR")
             except ValueError:
                 rgb = None            # malformed RGB payload — treat as a failed read
             except Exception as e:
@@ -752,8 +781,15 @@ class CycleRunner:
                     # Saturated but not one of the three fault colors. Not halting on it
                     # (see _classify_error_light), but it should never happen — log it
                     # loudly so the thresholds can be tuned against a real reading.
+                    hint = ""
+                    if self._classify_ring_color(r, g, b) == "green":
+                        # The error light has no green state; the RING does, at brew
+                        # completion. Seeing green here means this channel is looking at
+                        # the ring — a swapped MUX_CH_* assignment or miswired cover.
+                        hint = ("  <-- GREEN on the error channel: the error light has "
+                                "no green state. MUX channels are probably SWAPPED.")
                     print(f"[errlight] unclassified color R={r} G={g} B={b} "
-                          f"(spread {spread}) -- treating as idle")
+                          f"(spread {spread}) -- treating as idle{hint}")
                 if self._error_clear_since is None:
                     self._error_clear_since = time.time()   # fault-free streak starts
             stop_flag.wait(ERROR_LIGHT_POLL_S)
@@ -807,14 +843,12 @@ class CycleRunner:
             if self._error_flag.is_set(): return "error", self._error_detail
             status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
 
-            resp = f.send("GET COLOR RING", expect="RGB:", accept=("ERROR:",))
+            resp = f.send("GET COLOR RING TAG", expect="RGB:", accept=("ERROR:",))
             print(f"[serial] GET COLOR RING -> {resp!r}")
-            if not resp.startswith("RGB:"):
+            rgb = _parse_rgb(resp, "RING")
+            if rgb is None:
                 continue
-            try:
-                r, g, b = (int(x) for x in resp[4:].split(","))
-            except ValueError:
-                continue
+            r, g, b = rgb
 
             color = self._classify_ring_color(r, g, b)
             print(f"[ring]   R={r} G={g} B={b}  -> {color}")
