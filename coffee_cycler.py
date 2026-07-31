@@ -22,7 +22,7 @@ or BLUE. The light is always on -- its idle color is ~white, which is healthy an
 must never be read as a fault. The ring only reports the green brew-complete flash
 (plus the legacy orange/yellow operator prompt). See the ERROR_LIGHT_* notes.
 
-BLUE BLEED: between gate-close and the brew trigger the machine shows its blue
+BLUE BLEED: from gate-OPEN until the brew trigger the machine shows its blue
 "time to go" ring, which bleeds onto the ERROR sensor beside it. Blue ONLY is
 ignored for the width of that window (red/yellow still halt), and a suppressed
 reading resets the idle streak rather than counting as healthy.
@@ -77,7 +77,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 21:32"
+VERSION = "2026-07-31 21:38"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -186,15 +186,16 @@ ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before hal
 # never took and the machine is sitting at the START of a cycle: press the button again
 # and wait afresh rather than burning the whole ring timeout and halting the run.
 # -- Blue bleed onto the error sensor ------------------------------------------
-# Between gate-close and the brew trigger the machine shows its blue "time to go" RING,
+# From gate-OPEN until the brew trigger the machine shows its blue "time to go" RING,
 # and that blue bleeds onto the ERROR sensor sitting next to it. A blue error-light
 # reading in that window is therefore not trustworthy, and acting on it would halt a
 # perfectly healthy run right before the brew.
 #
 # So BLUE ONLY is ignored for the width of that window. Red and yellow still halt the
 # run there — the crosstalk is blue, so suppressing anything else would be throwing away
-# real faults for no reason. The window opens at gate-close and closes the instant CAP is
-# asserted, which is the narrowest span that covers the ring's ready glow.
+# real faults for no reason. The window opens at gate-OPEN and closes the instant CAP is
+# asserted: the glow already reaches the sensor while the gate is open, so starting at
+# gate-close left a stretch of the cycle where the bleed could still halt a good run.
 #
 # A suppressed blue does NOT count as evidence of health either: it resets the idle
 # streak, so a blue ring after the trigger still has to earn its "ready" verdict from
@@ -660,7 +661,7 @@ class CycleRunner:
         # When the watcher's current run of IDLE-WHITE error-light samples began
         # (None = no streak). Blue-ring disambiguation needs a streak, not one sample.
         self._error_clear_since: Optional[float] = None
-        # Set between gate-close and the brew trigger, while the ring is showing its blue
+        # Set from gate-open until the brew trigger, while the ring is showing its blue
         # "ready" glow — see BLUE_BLEED notes. Cross-thread (cycle sets, watcher reads).
         self._blue_bleed_window = threading.Event()
         self._last_trigger_time = 0.0   # set by _trigger_brew
@@ -1015,6 +1016,13 @@ class CycleRunner:
     def _door_cycle(self, num, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
         f = self.dev.front
         status_cb(num, "Opening gate...")
+        # Blue suppression starts HERE, at gate-OPEN, not at gate-close: the ring's blue
+        # ready glow already reaches the error sensor while the gate is open, so closing
+        # the window later left a stretch where the bleed could still halt a good run.
+        # Set before the servo command so the watcher can't sample the gap in between.
+        # (Pre-flight _check_error_light runs before this op, so a genuine blue water
+        # error still aborts the cycle before any coffee is staged.)
+        self._blue_bleed_window.set()
         resp_open = f.send(f"SET SERVO {SERVO_OPEN}", expect="SERVO:")
         print(f"[serial] SET SERVO {SERVO_OPEN} -> {resp_open!r}")
         if not _sleep(3.0, stop_flag): return self._abort_reason()
@@ -1069,12 +1077,8 @@ class CycleRunner:
                 return err
 
         # Gate settle — 1 s gap, then poll until machine shows blue (idle/ready).
-        # CAP stays high-impedance throughout.
-        #
-        # The gate is now closed and the machine is about to show its blue ready ring,
-        # which bleeds onto the error sensor — open the blue-suppression window here and
-        # let _trigger_brew close it. Red/yellow keep halting throughout.
-        self._blue_bleed_window.set()
+        # CAP stays high-impedance throughout. The blue-suppression window is already
+        # open (_door_cycle set it at gate-open); _trigger_brew closes it.
         if not _sleep(1.0, stop_flag): return self._abort_reason()
         if not self._wait_for_blue(stop_flag, status_cb): return self._abort_reason()
 
