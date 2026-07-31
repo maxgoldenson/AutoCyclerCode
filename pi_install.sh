@@ -52,6 +52,20 @@ fi
 say "Disabling ModemManager (it interferes with the serial boards)"
 sudo systemctl disable --now ModemManager 2>/dev/null || true
 
+# ── 1c. Never autosuspend USB. An idle numpad pendant that gets suspended can fail to
+#        wake for the entire session — the pendant looks dead from boot, and replugging
+#        does NOT fix it (it just re-enumerates into another idle period). Typing during
+#        boot is the known workaround, which is the tell. Power saving is pointless on a
+#        mains-powered fixture, and this also removes a source of USB-serial flakiness.
+#        The launcher repeats this at runtime so Pis already in the field get it too.
+say "Disabling USB autosuspend (keeps the numpad pendant alive)"
+sudo tee /etc/udev/rules.d/50-autocycler-usb-power.rules >/dev/null <<'RULE'
+# AutoCycler: keep every USB device powered on — see harden_usb_input() in launcher.py.
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"
+RULE
+sudo udevadm control --reload-rules 2>/dev/null || true
+sudo udevadm trigger --subsystem-match=usb --action=add 2>/dev/null || true
+
 # ── 2. arduino-cli (ESP32 flashing tool) ────────────────────────────────────
 say "Installing arduino-cli"
 if ! command -v arduino-cli >/dev/null 2>&1; then
@@ -134,6 +148,7 @@ chk "app (coffee_cycler.py) deployed"  "test -f '${DIR}/coffee_cycler.py'"
 chk "self-updating launcher deployed"  "grep -q 'def self_update' '${DIR}/launcher.py'"
 chk "firmware sketches deployed"        "test -f '${DIR}/AUTOCYCLER_DISPENSOR/AUTOCYCLER_DISPENSOR.ino' && test -f '${DIR}/AUTOCYCLER_FRONT/AUTOCYCLER_FRONT.ino'"
 chk "ModemManager disabled"            "! (systemctl is-enabled ModemManager 2>/dev/null | grep -q enabled)"
+chk "USB autosuspend rule installed"   "test -f /etc/udev/rules.d/50-autocycler-usb-power.rules"
 chk "serial access (dialout group)"    "getent group dialout | grep -qw '${USER}'"
 chk "passwordless sudo (auto-reboot)"  "sudo -n true 2>/dev/null"
 # Notifications are optional — report status without failing the install.

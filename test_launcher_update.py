@@ -257,6 +257,82 @@ def test_missing_toolchain_does_not_record():
     print("PASS: missing arduino-cli leaves the flash pending for retry")
 
 
+# --- USB input hardening (dead numpad after boot) ----------------------------
+def _fake_usb_tree(states):
+    """Build a fake sysfs USB tree; `states` is a list of power/control values."""
+    root = tempfile.mkdtemp(prefix="autocycler_usb_")
+    for i, state in enumerate(states):
+        d = os.path.join(root, f"usb{i}", "power")
+        os.makedirs(d)
+        with open(os.path.join(d, "control"), "w") as fh:
+            fh.write(state + "\n")
+    return os.path.join(root, "*", "power", "control")
+
+
+def _with_usb_tree(states, fn):
+    saved_glob, saved_run = launcher.USB_POWER_GLOB, launcher.subprocess.run
+    launcher.USB_POWER_GLOB = _fake_usb_tree(states)
+    try:
+        return fn()
+    finally:
+        launcher.USB_POWER_GLOB = saved_glob
+        launcher.subprocess.run = saved_run
+
+
+def test_usb_power_states_counts_suspended_devices():
+    def check():
+        total, on = launcher._usb_power_states()
+        assert (total, on) == (3, 1), (total, on)
+    _with_usb_tree(["auto", "on", "auto"], check)
+    print("PASS: USB power state scan counts autosuspending devices")
+
+
+def test_harden_usb_input_turns_autosuspend_off():
+    """The fix for the pendant that's dead until you type during boot: every USB device
+    must come out of autosuspend."""
+    def check():
+        calls = []
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            # Model `sudo sh -c` actually applying the change.
+            import glob as _glob
+            for p in _glob.glob(launcher.USB_POWER_GLOB):
+                with open(p, "w") as fh:
+                    fh.write("on\n")
+            return None
+        launcher.subprocess.run = fake_run
+        launcher.harden_usb_input()
+        assert calls, "hardening must actually shell out"
+        assert calls[0][:2] == ["sudo", "-n"], calls[0]
+        total, on = launcher._usb_power_states()
+        assert (total, on) == (2, 2), (total, on)
+    _with_usb_tree(["auto", "auto"], check)
+    print("PASS: USB hardening clears autosuspend on every device")
+
+
+def test_harden_usb_input_survives_no_sudo():
+    """A supervisor that died here would take the whole kiosk down over a power tweak."""
+    def check():
+        def boom(cmd, **kw):
+            raise OSError("sudo: command not found")
+        launcher.subprocess.run = boom
+        launcher.harden_usb_input()          # must not raise
+        total, on = launcher._usb_power_states()
+        assert (total, on) == (1, 0), (total, on)
+    _with_usb_tree(["auto"], check)
+    print("PASS: USB hardening is best-effort — a missing sudo never crashes the launcher")
+
+
+def test_harden_usb_input_noop_without_sysfs():
+    saved = launcher.USB_POWER_GLOB
+    launcher.USB_POWER_GLOB = os.path.join(_TMP, "no-such-usb", "*", "control")
+    try:
+        launcher.harden_usb_input()          # must not raise or shell out
+    finally:
+        launcher.USB_POWER_GLOB = saved
+    print("PASS: USB hardening no-ops when there is no sysfs USB tree")
+
+
 if __name__ == "__main__":
     # Order matters (state accumulates), so run explicitly rather than by sorted name.
     tests = [
@@ -273,6 +349,10 @@ if __name__ == "__main__":
         test_flash_gated_on_fw_version_not_md5,
         test_no_devices_present_defers_flash,
         test_missing_toolchain_does_not_record,
+        test_usb_power_states_counts_suspended_devices,
+        test_harden_usb_input_turns_autosuspend_off,
+        test_harden_usb_input_survives_no_sudo,
+        test_harden_usb_input_noop_without_sysfs,
     ]
     failed = 0
     for t in tests:

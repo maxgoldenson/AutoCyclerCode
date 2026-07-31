@@ -63,7 +63,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 17:36"
+VERSION = "2026-07-31 18:19"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -88,6 +88,10 @@ DISCOVERY_TIMEOUT = 4.0
 CMD_TIMEOUT       = 15.0
 BOOT_TIMEOUT      = 4.0
 AUTO_RECONNECT_S  = 15.0   # idle re-scan interval when devices aren't connected yet
+# Grace period before the kiosk grabs keyboard focus back (see _reclaim_keyboard_focus).
+# Long enough that a normal focus handover during startup settles on its own, short
+# enough that an operator never waits on it.
+FOCUS_REGRAB_AFTER_S = 2.0
 _POSIX            = (os.name == "posix")   # serial exclusive lock is POSIX-only
 _EXCLUSIVE        = True if _POSIX else None  # fail fast if a port is already open
 
@@ -1043,6 +1047,7 @@ class CoffeeCyclerApp:
         self.runner: Optional[object] = None   # live CycleRunner, used by _tick for adaptive ETA
         self._discovering         = False      # a discovery scan is in progress
         self._last_auto_discovery = 0.0        # last time idle auto-reconnect fired
+        self._focus_lost_at: Optional[float] = None   # when the app last had no focus
 
         # Pendant state
         self._pend_labels: dict = {}           # idx → tk.Label whose fg turns green when focused
@@ -1120,6 +1125,19 @@ class CoffeeCyclerApp:
         self.root.attributes("-fullscreen", True)
         # Escape exits fullscreen (useful during development)
         self.root.bind("<Escape>", lambda _e: self.root.attributes("-fullscreen", False))
+        # Claim keyboard focus once the window is actually mapped — focus_force() on an
+        # unmapped window does nothing, so this can't run inline. Without it the kiosk
+        # can come up behind the desktop's focus and ignore the pendant from boot.
+        self.root.after(300, self._claim_initial_focus)
+
+    def _claim_initial_focus(self):
+        try:
+            self.root.focus_force()
+            self.root.lift()
+        except tk.TclError as e:
+            print(f"[focus] initial focus grab failed: {e}")
+        if self._pend_items:
+            self._pend_focus(self._pend_idx)
 
     def _setup_styles(self):
         style = ttk.Style()
@@ -2221,7 +2239,42 @@ class CoffeeCyclerApp:
         self.status_var.set(text)
         self.status_label.configure(fg=color)
 
+    def _reclaim_keyboard_focus(self):
+        """Take keyboard focus back if the app lost it entirely.
+
+        The numpad is the ONLY input on this kiosk: there is no mouse to click the
+        window with, so a toplevel that never received focus at boot is indistinguishable
+        from a dead pendant, and the operator has no way out of it. X can hand focus
+        elsewhere when the window manager maps the desktop after we start, which is
+        exactly the boot-time race. A dialog holding focus still counts as ours, so this
+        never steals from a modal."""
+        try:
+            # None => focus is on a foreign window (or nowhere). A KeyError/TclError
+            # means Tk can't even resolve the focused window, which is also "not ours".
+            has_focus = self.root.focus_displayof() is not None
+        except (KeyError, tk.TclError):
+            has_focus = False
+        if has_focus:
+            self._focus_lost_at = None
+            return
+        now = time.time()
+        if self._focus_lost_at is None:
+            self._focus_lost_at = now      # start the grace period, don't grab yet
+            return
+        if now - self._focus_lost_at < FOCUS_REGRAB_AFTER_S:
+            return
+        self._focus_lost_at = now          # rate-limit: one attempt per grace period
+        print("[focus] no keyboard focus -- reclaiming it for the pendant")
+        try:
+            self.root.focus_force()
+            if self._pend_items:
+                self._pend_focus(self._pend_idx)   # re-point at the highlighted row
+        except tk.TclError as e:
+            print(f"[focus] reclaim failed: {e}")
+
     def _tick(self):
+        self._reclaim_keyboard_focus()
+
         # Auto-reconnect when idle and not connected, so the kiosk recovers on its own
         # once the USB module(s) are plugged in — no manual Reconnect needed. Works with
         # one, both, or no devices present; it just keeps retrying until both are found.

@@ -343,6 +343,95 @@ def _upload_board(board: str, port: str) -> bool:
         return False
 
 
+# ── USB input hardening ─────────────────────────────────────────────────────────
+# Symptom: after some boots the numpad pendant is dead for the WHOLE session, but
+# pressing keys DURING boot leaves it working, and replugging it does NOT recover it.
+#
+# That combination points at USB autosuspend, not enumeration. Replugging fixes an
+# enumeration failure, so the device is clearly being seen; what it does NOT fix is a
+# device that enumerates, sits idle, gets autosuspended, and then fails to wake --
+# because the replug just drops it into another idle period. Typing during boot keeps
+# it out of suspend in the first place, which is exactly the reported workaround. Cheap
+# HID numpads are a well-known source of unreliable remote-wakeup.
+#
+# Power saving is worthless on a mains-powered test fixture, so switch it off for every
+# USB device and make that the default for anything hotplugged later. The same setting
+# also removes a known source of USB-serial flakiness on the ESP32 links.
+#
+# pi_install.sh installs a udev rule that does this at device-add time on new images;
+# this runtime pass is what reaches the Pis already in the field, since the launcher
+# self-updates over the air and pi_install.sh does not.
+# Module-level so tests can point them at a fake sysfs tree.
+USB_POWER_GLOB   = "/sys/bus/usb/devices/*/power/control"
+INPUT_BY_ID_DIR  = "/dev/input/by-id"
+_USB_POWER_CONTROL_SH = r'''
+for f in /sys/bus/usb/devices/*/power/control; do
+  [ -e "$f" ] && echo on > "$f" 2>/dev/null
+done
+if [ -e /sys/module/usbcore/parameters/autosuspend ]; then
+  echo -1 > /sys/module/usbcore/parameters/autosuspend 2>/dev/null
+fi
+exit 0
+'''
+
+
+def _usb_power_states():
+    """-> (total, on) counts across every USB device's power/control node."""
+    import glob
+    total = on = 0
+    for path in glob.glob(USB_POWER_GLOB):
+        total += 1
+        try:
+            with open(path) as fh:
+                if fh.read().strip() == "on":
+                    on += 1
+        except OSError:
+            pass
+    return total, on
+
+
+def harden_usb_input():
+    """Disable USB autosuspend so an idle numpad can't suspend itself into a dead
+    session. Best-effort: logs what it managed and never raises, because a supervisor
+    that dies here would take the whole kiosk down over a power-management tweak."""
+    if not sys.platform.startswith("linux"):
+        return                      # dev machines / CI: nothing to do
+    before_total, before_on = _usb_power_states()
+    if before_total == 0:
+        log.info("USB power hardening skipped: no sysfs USB devices visible.")
+        return
+    try:
+        # -n: fail fast instead of blocking on a password prompt if passwordless sudo
+        # is missing. One shell does every node, rather than N sudo round trips.
+        subprocess.run(["sudo", "-n", "sh", "-c", _USB_POWER_CONTROL_SH],
+                       timeout=20, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log.warning("USB power hardening could not run (%s) — pendant may sleep.", e)
+        return
+    total, on = _usb_power_states()
+    log.info("USB autosuspend off for %d/%d devices (was %d/%d).",
+             on, total, before_on, before_total)
+    if on < total:
+        log.warning("%d USB device(s) still autosuspending — needs passwordless sudo "
+                    "or the udev rule from pi_install.sh.", total - on)
+    _log_input_devices()
+
+
+def _log_input_devices():
+    """Record which input devices the kernel can see. A dead pendant is either absent
+    here (USB/kernel problem) or present here (X11 / focus problem) — that one line
+    splits the diagnosis without needing someone in front of the machine."""
+    try:
+        names = sorted(os.listdir(INPUT_BY_ID_DIR))
+    except OSError:
+        names = []
+    if names:
+        log.info("Input devices: %s", ", ".join(names))
+    else:
+        log.warning("No /dev/input/by-id entries — the pendant is not attached.")
+
+
 def _reboot_pi():
     """Reboot the Pi — the known-good way to bring freshly-flashed ESP32 boards back
     online (the auto-reset after flashing isn't dependable on this hardware). Safe from a
@@ -772,6 +861,9 @@ def main():
         time.sleep(30)
         return
     kill_stray_apps()   # clear any orphan app holding the serial ports from a prior run
+    # Before the UI comes up: a pendant that autosuspends during boot is dead for the
+    # rest of the session, and the operator has no other input device to recover with.
+    harden_usb_input()
 
     app = App()
 
