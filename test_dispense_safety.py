@@ -460,15 +460,20 @@ def _run_cycle_with_front(front_model, ring_timeout=5):
     dm    = types.SimpleNamespace(dispenser=disp, front=front)
     runner = cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=ring_timeout,
                             ring_warning_cb=lambda _c, _d: "resume")
-    orig_sleep = cc._sleep
+    orig_sleep   = cc._sleep
+    orig_confirm = cc.RING_READY_CONFIRM_S
     # Keep _sleep real-but-short: the watcher is a thread, so collapsing every wait to
-    # zero would race the cycle past it before it ever samples.
+    # zero would race the cycle past it before it ever samples. Shrink the dark-streak
+    # window to match, so a full-cycle test doesn't burn real flash periods waiting for
+    # the error light to be confirmed dark.
     cc._sleep = lambda secs, stop_flag: not stop_flag.wait(min(secs, 0.05))
+    cc.RING_READY_CONFIRM_S = 0.02
     try:
         return runner.run_one(stop_flag=threading.Event(),
                               status_cb=lambda _n, _lbl: None)
     finally:
         cc._sleep = orig_sleep
+        cc.RING_READY_CONFIRM_S = orig_confirm
 
 
 def test_error_light_halts_the_run():
@@ -485,6 +490,105 @@ def test_error_light_clear_lets_the_cycle_finish():
     ok, msg = _run_cycle_with_front(FrontBoard())
     assert ok, msg
     print("PASS: a dark error light leaves the cycle untouched")
+
+
+# --- blue ring + dark error light = "ready", so re-trigger the brew -----------
+def _ready_ring_runner(ring_reads, ring_timeout=1):
+    """Runner whose ring reads from a script and whose error light is always dark."""
+    q = list(ring_reads)
+    def handler(cmd):
+        if cmd.startswith("GET COLOR ERROR"):
+            return [b"RGB:85,85,85\n"]              # neutral = light off
+        return [q.pop(0) if len(q) > 1 else q[0]]
+    front = _make_device(handler)
+    dm    = types.SimpleNamespace(dispenser=_make_device(Board()), front=front)
+    return cc.CycleRunner(dm, ring_wait_min=0, ring_timeout=ring_timeout,
+                          ring_warning_cb=lambda _c, _d: "resume")
+
+
+def test_ready_ring_asks_for_a_retrigger():
+    """Blue ring while waiting for green, with the error light confirmed dark, means the
+    machine is back at the start of a cycle: the brew trigger never took."""
+    runner = _ready_ring_runner([b"RGB:10,10,220\n"])
+    runner._error_clear_since = time.time() - (cc.RING_READY_CONFIRM_S + 0.5)
+    outcome, detail = runner._wait_for_ring(time.time(), threading.Event(),
+                                            lambda _n, _lbl: None)
+    assert outcome == "retrigger", (outcome, detail)
+    print("PASS: ready ring + dark error light -> asks for a brew re-trigger")
+
+
+def test_blue_ring_waits_for_a_confirmed_dark_streak():
+    """A single dark sample is not enough at 1 Hz -- it can land between blinks. Until
+    the streak is long enough, blue carries no information and we keep polling."""
+    runner = _ready_ring_runner([b"RGB:10,10,220\n"])
+    runner._error_clear_since = time.time()          # streak just started
+    outcome, _d = runner._wait_for_ring(time.time(), threading.Event(),
+                                        lambda _n, _lbl: None)
+    assert outcome == "timeout", outcome
+    runner2 = _ready_ring_runner([b"RGB:10,10,220\n"])
+    runner2._error_clear_since = None                # never seen dark at all
+    outcome2, _d2 = runner2._wait_for_ring(time.time(), threading.Event(),
+                                           lambda _n, _lbl: None)
+    assert outcome2 == "timeout", outcome2
+    print("PASS: blue needs a CONFIRMED dark streak before it counts as ready")
+
+
+def test_retrigger_presses_the_brew_button_again_then_resumes():
+    """End to end: ring sits at ready, so the cycle re-pulses CAP and carries on to the
+    green flash instead of burning the ring timeout and halting the run."""
+    class ReadyThenBrews(FrontBoard):
+        """Ready (blue) until the SECOND cap pulse, then brews through to green."""
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                return [b"RGB:85,85,85\n"]
+            if cmd.startswith("GET COLOR RING"):
+                if self.cap_pulses >= 2:
+                    return [b"RGB:10,220,10\n"]      # green -- brew complete
+                return [b"RGB:10,10,220\n"]          # blue  -- still at ready
+            return super().__call__(cmd)
+
+    front_model = ReadyThenBrews()
+    ok, msg = _run_cycle_with_front(front_model, ring_timeout=5)
+    assert ok, msg
+    assert front_model.cap_pulses == 2, front_model.cap_pulses
+    print("PASS: ready ring -> brew re-triggered once, cycle then completes")
+
+
+def test_retrigger_gives_up_rather_than_hammering_the_button():
+    """A machine that keeps returning to ready is not fixed by more pulses, and
+    repeatedly pressing the brew button is its own hazard."""
+    class AlwaysReady(FrontBoard):
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                return [b"RGB:85,85,85\n"]
+            if cmd.startswith("GET COLOR RING"):
+                return [b"RGB:10,10,220\n"]          # never leaves ready
+            return super().__call__(cmd)
+
+    front_model = AlwaysReady()
+    ok, msg = _run_cycle_with_front(front_model, ring_timeout=1)
+    assert not ok, msg
+    assert "returned to ready" in msg, msg
+    assert "Stopped" not in msg, msg      # must reach _on_error, not the quiet path
+    assert front_model.cap_pulses == cc.RING_RETRIGGER_MAX + 1, front_model.cap_pulses
+    print("PASS: repeated ready rings give up after a bounded number of re-triggers")
+
+
+def test_brew_is_only_triggered_from_a_running_cycle():
+    """The cycler must never press the brew button when it wasn't asked to run. CAP is
+    pulsed in exactly one place, and that place is only reachable from _run_one."""
+    import inspect
+    # _do_cap_reset is the operator-invoked reset, itself only reachable from the ring
+    # warning dialog during a run; every other CAP assertion must live in _trigger_brew.
+    pulsers = [name for name, fn in inspect.getmembers(cc.CycleRunner, inspect.isfunction)
+               if 'send("SET CAP ON"' in inspect.getsource(fn)]
+    assert sorted(pulsers) == ["_do_cap_reset", "_trigger_brew"], pulsers
+    assert "_trigger_brew(" in inspect.getsource(cc.CycleRunner._run_one)
+    # The GUI must never assert CAP: its idle, discovery and shutdown paths all run when
+    # no cycle was requested, and pressing the brew button there would brew unbidden.
+    assert 'send("SET CAP ON"' not in inspect.getsource(cc.CoffeeCyclerApp), \
+        "the GUI must never press the brew button"
+    print("PASS: the brew button is pressed from exactly one in-run code path")
 
 
 def test_unreadable_error_light_halts_the_run():
@@ -617,6 +721,11 @@ if __name__ == "__main__":
         test_error_light_saturation_detects_every_color,
         test_error_light_halts_the_run,
         test_error_light_clear_lets_the_cycle_finish,
+        test_ready_ring_asks_for_a_retrigger,
+        test_blue_ring_waits_for_a_confirmed_dark_streak,
+        test_retrigger_presses_the_brew_button_again_then_resumes,
+        test_retrigger_gives_up_rather_than_hammering_the_button,
+        test_brew_is_only_triggered_from_a_running_cycle,
         test_unreadable_error_light_halts_the_run,
         test_ring_timeout_stops_run_as_error,
         test_send_still_retries_idempotent_commands,

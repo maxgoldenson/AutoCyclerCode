@@ -11,15 +11,23 @@ Cycle sequence per brew (identical for both machine modes):
   3. Servo OPEN -> 3 s -> CLOSE
   4. Wait for blue (ready), SET CAP ON -> pulse -> OFF  -- trigger machine brew
   5. Wait RING_WAIT_MIN_S, then poll Ring sensor for green completion flash
-     * Green flash     -> proceed to next cycle
-     * Orange / yellow -> pause and prompt user (resume / reset / stop)
-     * Timeout         -> assume the brew failed: halt the run as an error
+     * Green flash       -> proceed to next cycle
+     * Blue + dark light -> the trigger never took: press brew again and resume
+     * Orange / yellow   -> pause and prompt user (resume / reset / stop)
+     * Timeout           -> assume the brew failed: halt the run as an error
 
 ERRORS COME FROM THE ERROR LIGHT, NOT THE RING. A background watcher samples the
 error light for the whole cycle and halts the run the moment it lights in ANY
 color; the ring only reports the green brew-complete flash (plus the legacy
-orange/yellow operator prompt). Ring BLUE is ignored -- the machine drives it
-both for "time to go" and for a water error. See the ERROR_LIGHT_* notes.
+orange/yellow operator prompt). See the ERROR_LIGHT_* notes.
+
+Ring BLUE means either "time to go" (idle/ready) or a water error, and the error
+light is what tells them apart: confirmed dark => ready, lit => water error. A
+ready ring while we are waiting for a brew means the trigger never took, so the
+cycle re-presses the brew button (bounded by RING_RETRIGGER_MAX) and waits
+afresh rather than burning the ring timeout. The brew button is pressed from
+exactly one place, reachable only from a requested run -- the cycler never brews
+when it wasn't asked to.
 
 The Machine switch (2.2.x / 3.0) in the CONFIGURATION panel records which machine
 is on the fixture. Both modes currently behave identically; it is the hook for
@@ -63,7 +71,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 18:19"
+VERSION = "2026-07-31 18:23"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -144,6 +152,20 @@ ERROR_LIGHT_POLL_S    = 0.2   # sample interval — several samples per flash pe
 ERROR_LIGHT_CLEAR_S   = 1.6   # pre-flight observation window (> one full 1 Hz period)
 ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before halting:
                               # a blind error detector is worse than no run at all
+
+# -- Blue-ring disambiguation --------------------------------------------------
+# A blue RING means either "time to go" (idle, ready to brew) or a water error. The
+# ERROR LIGHT settles it: dark => ready, lit => water error. Because the light blinks,
+# "dark" is only meaningful once it has been continuously dark for longer than a full
+# flash period, so a sample that lands between blinks can't be mistaken for all-clear.
+#
+# When the ring reads ready while we are waiting for a brew to finish, the brew trigger
+# never took and the machine is sitting at the START of a cycle: press the button again
+# and wait afresh rather than burning the whole ring timeout and halting the run.
+RING_READY_CONFIRM_S = 2.0   # error light continuously dark this long => "ready"
+RING_RETRIGGER_MAX   = 2     # brew re-triggers per cycle before giving up; a machine
+                             # that keeps returning to ready is not going to be fixed
+                             # by more pulses, and hammering the button is a hazard
 
 # -- Ring sensor color thresholds ---------------------------------------------
 RING_GREEN_MIN_G          = 40
@@ -556,6 +578,10 @@ class CycleRunner:
         # Set by the error-light watcher thread; read by every wait loop in the cycle.
         self._error_flag   = threading.Event()
         self._error_detail = ""
+        # When the watcher's current run of DARK error-light samples began (None = no
+        # streak). Blue-ring disambiguation needs a streak, not a single sample.
+        self._error_clear_since: Optional[float] = None
+        self._last_trigger_time = 0.0   # set by _trigger_brew
 
     @property
     def mean_cycle_s(self) -> float:
@@ -611,6 +637,16 @@ class CycleRunner:
         self._error_detail = detail
         self._error_flag.set()
 
+    def _error_light_confirmed_dark(self) -> bool:
+        """True once the watcher has seen the error light CONTINUOUSLY dark for longer
+        than a full flash period. At ~1 Hz a single dark sample proves nothing — it can
+        simply have landed between blinks — so this is the evidence needed before a blue
+        ring may be read as "ready" rather than "water error". Any read failure resets
+        the streak: losing sight of the light is not the same as seeing it dark."""
+        if self._error_flag.is_set() or self._error_clear_since is None:
+            return False
+        return (time.time() - self._error_clear_since) >= RING_READY_CONFIRM_S
+
     def _error_pending(self) -> Optional[tuple[bool, str]]:
         """The (ok, msg) tuple the cycle must exit with, or None to carry on."""
         if not self._error_flag.is_set():
@@ -637,6 +673,9 @@ class CycleRunner:
                 print(f"[errlight] read failed: {e}")
             if rgb is None:
                 fails += 1
+                # Lost sight of the light — that is not evidence it is dark, so the
+                # "confirmed dark" streak has to start over.
+                self._error_clear_since = None
                 if fails >= ERROR_LIGHT_MAX_FAILS:
                     # Can't see the light at all. Since it is the only error detector,
                     # running blind is worse than stopping.
@@ -649,11 +688,14 @@ class CycleRunner:
                     self._flag_error(f"Error light ON -- R={r} G={g} B={b} "
                                      f"(sat {max(rgb) - min(rgb)})")
                     return
+                if self._error_clear_since is None:
+                    self._error_clear_since = time.time()   # dark streak starts here
             stop_flag.wait(ERROR_LIGHT_POLL_S)
 
     def _start_error_watch(self, stop_flag) -> threading.Thread:
         self._error_flag.clear()
         self._error_detail = ""
+        self._error_clear_since = None   # no dark streak until this watcher samples
         t = threading.Thread(target=self._error_light_worker, args=(stop_flag,),
                              daemon=True)
         t.start()
@@ -675,9 +717,11 @@ class CycleRunner:
         """
         Poll for the green brew-complete flash.
         Green  → return immediately so the dispenser can start the next cycle.
-        Blue   → ignored. The ring reuses blue for the harmless "time to go" state and
-                 for a water error, so it can't tell a healthy machine from a faulted
-                 one. Errors are the error light's job now (see the ERROR_LIGHT_* notes).
+        Blue   → the error light decides. Dark for a confirmed streak means this is the
+                 "time to go" READY ring, so the trigger never took: return "retrigger"
+                 and the caller presses the brew button again. Not yet confirmed dark →
+                 no information, keep polling (a genuinely lit light halts the cycle via
+                 the watcher). See the RING_READY_CONFIRM_S notes.
         Orange / yellow → warning: still prompts the operator, as a second net.
         Error light     → halt immediately, whatever the ring says.
         Timeout         → no green seen: the caller halts the run as an error.
@@ -715,8 +759,17 @@ class CycleRunner:
                 return "green", f"R={r} G={g} B={b}"
 
             if color == "blue":
-                # Ambiguous by design ("time to go" vs water error) -- carries no
-                # information about whether the brew failed, so keep polling for green.
+                # Blue alone is ambiguous ("time to go" vs water error). The ERROR LIGHT
+                # breaks the tie: confirmed dark for longer than a full flash period
+                # means this is the READY ring, so the machine is sitting at the start of
+                # a cycle and our brew trigger never took. Hand back to _run_one to
+                # press the button again and wait afresh, instead of burning the whole
+                # ring timeout and halting a run that only needed one more pulse.
+                if self._error_light_confirmed_dark():
+                    return "retrigger", (f"ready ring, error light dark "
+                                         f"(R={r} G={g} B={b})")
+                # Error light not yet confirmed dark: no information either way, so keep
+                # polling. If it is genuinely lit the watcher halts the cycle anyway.
                 continue
 
             if color in ("orange", "yellow"):
@@ -838,6 +891,27 @@ class CycleRunner:
         print(f"[serial] SET SERVO {SERVO_REST} -> {resp_close!r}")
         return None
 
+    def _trigger_brew(self, stop_flag, status_cb) -> Optional[tuple[bool, str]]:
+        """Pulse CAP to press the machine's brew button, recording the trigger time.
+
+        ⚠ This is the ONLY place the brew button is pressed, and it is reachable only
+        from _run_one -- i.e. only while a requested run is in progress. Nothing here
+        may ever be called from idle/discovery paths: the cycler must never brew when
+        it wasn't asked to."""
+        f = self.dev.front
+        resp_cap = f.send("SET CAP ON", expect="CAP:")
+        self._last_trigger_time = time.time()
+        print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
+        if not _sleep(CAP_PULSE_S, stop_flag):
+            f.send("SET CAP OFF", expect="CAP:")
+            return self._abort_reason()
+        resp_cap = f.send("SET CAP OFF", expect="CAP:")
+        print(f"[serial] SET CAP OFF -> {resp_cap!r}")
+        if not self._step(4, "Brew triggered", status_cb, stop_flag,
+                          elapsed=CAP_PULSE_S, hold=1.5):
+            return self._abort_reason()
+        return None
+
     def _run_one(self, stop_flag, status_cb) -> tuple[bool, str]:
         self._cycle_count += 1
         f = self.dev.front
@@ -864,19 +938,30 @@ class CycleRunner:
         if not _sleep(1.0, stop_flag): return self._abort_reason()
         if not self._wait_for_blue(stop_flag, status_cb): return self._abort_reason()
 
-        resp_cap = f.send("SET CAP ON", expect="CAP:")
-        trigger_time = time.time()
-        print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
-        if not _sleep(CAP_PULSE_S, stop_flag):
-            f.send("SET CAP OFF", expect="CAP:")
-            return self._abort_reason()
-        resp_cap = f.send("SET CAP OFF", expect="CAP:")
-        print(f"[serial] SET CAP OFF -> {resp_cap!r}")
-        if not self._step(4, "Brew triggered", status_cb, stop_flag,
-                          elapsed=CAP_PULSE_S, hold=1.5):
-            return self._abort_reason()
+        # Trigger the brew, then wait for green. If the ring turns out to be sitting at
+        # "time to go" (ready) with the error light dark, the trigger never took and
+        # _wait_for_ring hands back "retrigger" so we pulse CAP again and wait afresh.
+        retriggers = 0
+        while True:
+            early_exit = self._trigger_brew(stop_flag, status_cb)
+            if early_exit is not None:
+                return early_exit
+            trigger_time = self._last_trigger_time
 
-        outcome, detail = self._wait_for_ring(trigger_time, stop_flag, status_cb)
+            outcome, detail = self._wait_for_ring(trigger_time, stop_flag, status_cb)
+            if outcome != "retrigger":
+                break
+            retriggers += 1
+            if retriggers > RING_RETRIGGER_MAX:
+                # Triggering isn't taking. More pulses won't fix a machine that keeps
+                # returning to ready, and hammering the brew button is its own hazard.
+                status_cb(5, "Machine stays at ready after re-trigger -- stopping")
+                return False, (f"Machine returned to ready after {retriggers} brew "
+                               f"triggers -- {detail}")
+            print(f"[ring]   self-correct: {detail} -- re-triggering brew "
+                  f"({retriggers}/{RING_RETRIGGER_MAX})")
+            status_cb(5, f"Machine at ready -- re-triggering brew ({retriggers})")
+
         if outcome == "stopped":
             return False, "Stopped"
         if outcome == "error":

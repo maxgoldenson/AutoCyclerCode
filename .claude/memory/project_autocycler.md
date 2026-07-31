@@ -53,8 +53,23 @@ strong cast. That catches every fault color without enumerating them. Tune
   `ERROR_LIGHT_CLEAR_S` (> one full period) and asks the watcher.
 - An unreadable sensor (`ERROR_LIGHT_MAX_FAILS` consecutive bad reads) halts the run:
   it's the only error detector, so running blind is worse than stopping.
-- Ring **blue is ignored in both modes** — the machine reuses it for "time to go" and for
-  a water error. Ring orange/yellow still raise the operator prompt as a second net.
+- Ring **blue is disambiguated by the error light**, in both modes: the machine reuses
+  blue for "time to go" (idle/ready) and for a water error, and the light settles it —
+  confirmed dark (`_error_light_confirmed_dark`, a continuous streak ≥
+  `RING_READY_CONFIRM_S`, never a single sample) means ready. A ready ring while waiting
+  for green means the brew trigger never took, so `_run_one` re-presses the brew button
+  (`_trigger_brew`) and waits afresh, bounded by `RING_RETRIGGER_MAX`; past that it halts
+  rather than hammering the button. Ring orange/yellow still raise the operator prompt.
+- ⭐ **CAP (the brew button) is asserted in exactly two places** — `_trigger_brew` and
+  `_do_cap_reset` — both reachable only from a requested run. The GUI never asserts CAP.
+  A test pins this: the cycler must never brew when it wasn't asked to.
+
+**Kiosk input hardening:** USB autosuspend is disabled at boot
+(`launcher.harden_usb_input()`, plus a udev rule from `pi_install.sh`) — an idle numpad
+that suspends can fail to wake for the whole session, which showed up as "pendant dead
+unless you type during boot, and replugging doesn't help". The app also re-claims
+keyboard focus (`_reclaim_keyboard_focus` in `_tick`) since the pendant is the only
+input and there's no mouse to recover with.
 
 **Machine mode (2.2.x / 3.0):** segmented switch in the CONFIGURATION panel, pendant item
 5 (kind `toggle`), persisted as `machine_mode`. Records which machine is on the fixture;
