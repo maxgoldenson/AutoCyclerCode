@@ -42,27 +42,44 @@ watch error light 1 flash period → SET ANGLE 360 (~19 g) → servo OPEN → 3 
 
 **ERRORS COME FROM THE ERROR LIGHT, NOT THE RING.** ⭐ The error light is **always on** —
 its COLOR is the signal, not whether it's lit. Idle is **~white and healthy**; only
-**red / yellow / blue** are faults (blue = water error), flashing at ~1 Hz.
+**red / yellow / blue** are faults (blue = water error), and each is a STATIC hold.
 `CycleRunner._error_light_worker` is a daemon thread that samples it for the WHOLE cycle
 (including the dispense, which blocks on the *other* serial port) and halts the run the
 moment it shows a fault color. `_classify_error_light` does the classification on
 chromaticity (`readRGB()` divides each channel by clear, so brightness is normalized out):
-near-neutral within `ERROR_LIGHT_WHITE_MAX_SPREAD` is idle, and the three fault colors are
-matched by channel ratios like the ring classifier. ⭐ **Blue needs three gates, not one**
-(`_blue_metrics`: dominance ≥2.0x both channels, magnitude ≥160, purity ≥0.50 share) —
-a single 1.4x ratio let white-ish scans (red/green still at the ~85 neutral, only blue
-nudged) read as blue and halt healthy runs. Measured impostors top out ~1.67x / 0.45
-share, real blues start ~2.1x / 0.51, so the thresholds sit in that gap. A blue-ish
-reading that misses prints its metrics and the failed gate — that log line is the tuning
-data, and a REAL blue landing there is a water error going unhalted. **Reading white as a fault would halt
-every run on a good machine** — that direction is the one to protect. A saturated color
-matching none of the three is logged as unclassified and NOT halted (the light is only
-meant to show those four states, so it means the thresholds need tuning). Tune from the
-`[errlight]` log lines. Identical on 2.2.x and 3.0 — nothing in the path reads
-`self.machine`, pinned by `test_error_light_is_identical_in_both_modes`.
-- Never conclude "no fault" from one sample — a flashing fault color looks white for half
-  its cycle. The pre-flight step waits `ERROR_LIGHT_CLEAR_S` (> one full period) and asks
-  the watcher.
+⭐ **Ground truth is in the MACHINE's firmware** (`uiux.c` / `serial_led.c`, zip read
+2026-08-03), not guesswork. The error light is the **Maintainance status icon**, and these
+are the only colors it is ever set to (through the machine's gamma table into the
+chromaticity this sensor reports):
+
+| machine state | LED | sensor sees | fault? |
+|---|---|---|---|
+| Error / WaterLeak / CriticalFault | RUST | (239,16,0) | **yes** (red) |
+| Warning | SCHOOL_BUS_YELLOW | (161,94,0) | **yes** (yellow) |
+| **FillingError — the water error** | **DODGER_BLUE** | **(1,47,207)** | **yes** (blue) |
+| UserErrorIndicator (attention) | WHITE, flashing | (85,85,85) | no |
+| ...Success | GREEN | (0,255,0) | no |
+| idle | WHITE / OFF | (85,85,85) | no |
+
+⭐ **Why blue mistriggered.** The 24-LED ring sits right next to this sensor, and
+`UIUX_Animate_ReadyStartCup` — the "press start" state the fixture WAITS in — lights the
+whole ring `PURE_BLUE`. So mid-cycle the sensor reads neighbouring WHITE icons + blue
+spill. White raises red and green equally, so **bleed always lands at g ≈ r** (94,86,255),
+while the real water error has **g far above r** (1,47,207). `ERROR_LIGHT_BLUE_G_OVER_R`
+is that discriminator — no brightness or blueness threshold can separate the two.
+
+⭐ **Persistence** (`ERROR_LIGHT_CONFIRM_SAMPLES` / `_S`): every real fault on this icon is
+a STATIC hold in the machine firmware (all of them stop the animation timer), so a genuine
+fault reads the same color on every sample forever. A color that comes and goes is an
+animation frame or a glitch. Requiring a held fault costs ~1 s on an already-stopped
+machine and kills transient mistriggers.
+
+Yellow is tested BEFORE red (SCHOOL_BUS_YELLOW also satisfies the red rule and was being
+mislabelled), and GREEN is the machine's SUCCESS state — never a fault, and never evidence
+of swapped mux channels.
+
+- The pre-flight step waits `ERROR_LIGHT_CLEAR_S` and asks the watcher rather than
+  taking a single reading of its own.
 - ⭐ **Blue bleed:** from **gate-OPEN** until the brew trigger the ring's blue "ready"
   glow bleeds onto the ERROR sensor, so **blue only** is ignored in that window
   (`_blue_bleed_window`, set in `_door_cycle` at gate-open, cleared in `_trigger_brew`
@@ -88,9 +105,9 @@ so a mux on the wrong channel silently returns the WRONG sensor's color (the err
 appearing to show a ring color → phantom water error, or a hidden fault). Guards:
 firmware reads the mux control register back after switching (`muxSelect`), and every
 color read asks `GET COLOR <sensor> TAG` so the reply names its source; `_parse_rgb`
-discards a reply tagged with a different sensor. If the ERROR channel ever reads *green*
-the log says so loudly — the error light has no green state, so that means the
-`MUX_CH_RING`/`MUX_CH_ERROR` assignment is swapped relative to the wiring.
+discards a reply tagged with a different sensor. (An earlier note here claimed green on
+the error channel proves swapped channels — it does NOT: green is the machine's success
+indicator on that very icon. That check was removed.)
 
 **Door cover is hot-pluggable:** it carries the I2C mux AND both color sensors, so the
 whole chain can vanish/return at any time. `AUTOCYCLER_FRONT.ino` re-establishes it on
