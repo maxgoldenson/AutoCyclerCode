@@ -77,7 +77,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-03 18:39"
+VERSION = "2026-08-03 19:42"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -222,6 +222,12 @@ ERROR_LIGHT_BLUE_MIN_SHARE   = 0.50
 # both toward zero (pure spill reads (0,0,255), where g > r*1.25 is false). No brightness
 # or blueness threshold can separate these two — only the red/green relationship can.
 ERROR_LIGHT_BLUE_G_OVER_R    = 1.25
+# ...and an ABSOLUTE floor on the same gap, because the ratio degenerates exactly where
+# the bleed is worst. The Brew icon BLINKS, so white content falls toward zero on every
+# off-phase; at that point r is a couple of counts of sensor noise and "g > r * 1.25"
+# becomes meaningless -- (1,2,255) passes it. A real fill error clears this comfortably
+# (DODGER_BLUE gives g-r = 46) while every white+blue mix is negative or near zero.
+ERROR_LIGHT_BLUE_GR_MARGIN   = 15
 ERROR_LIGHT_FAULT_COLORS = ("red", "yellow", "blue")
 ERROR_LIGHT_POLL_S    = 0.2   # sample interval — several samples per flash period
 ERROR_LIGHT_CLEAR_S   = 1.6   # pre-flight observation window (> one full 1 Hz period)
@@ -803,7 +809,9 @@ class CycleRunner:
         error, so the tuning data has to be in the log by default, not behind a rebuild."""
         total = max(1, r + g + b)
         share = b / total
-        return (b > r * ERROR_LIGHT_BLUE_B_OVER_R and g > r * ERROR_LIGHT_BLUE_G_OVER_R,
+        return (b > r * ERROR_LIGHT_BLUE_B_OVER_R
+                and g > r * ERROR_LIGHT_BLUE_G_OVER_R
+                and (g - r) >= ERROR_LIGHT_BLUE_GR_MARGIN,
                 b >= ERROR_LIGHT_BLUE_MIN_B,
                 share >= ERROR_LIGHT_BLUE_MIN_SHARE,
                 share)
@@ -856,8 +864,12 @@ class CycleRunner:
             if rgb is None:
                 fails += 1
                 # Lost sight of the light — that is not evidence it is healthy, so
-                # the "confirmed idle" streak has to start over.
+                # the "confirmed idle" streak has to start over. The fault run breaks
+                # too: a read we never got cannot be part of a run of CONSECUTIVE fault
+                # samples, and letting fault/fail/fault accumulate would confirm a fault
+                # that was never actually held.
                 self._error_clear_since = None
+                pending_color, pending_n = None, 0
                 if resp:
                     reason = resp
                 if fails >= ERROR_LIGHT_MAX_FAILS:

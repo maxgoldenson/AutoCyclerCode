@@ -472,6 +472,11 @@ def test_ring_bleed_never_reads_as_the_water_error():
         (85, 85, 255),   # white icons + full ring spill
         (40, 38, 255),   # dimmer white (Brew icon mid-blink) + spill
         (0,   0, 255),   # pure ring spill, no white at all
+        (1,   2, 255),   # pure spill + sensor noise -- the ratio alone passes this
+        (2,   4, 250),   # ditto, slightly more noise
+        (100, 120, 240), # clears BOTH the b>2r gate and the absolute g-r margin (20),
+                         # so only the g/r RATIO rejects it -- each gate earns its keep
+                         # at a different point in the white/blue mix range
         (120, 110, 240), # bright white + spill
     ]
     for rgb in bleeds:
@@ -494,6 +499,31 @@ def test_white_ish_readings_are_not_blue():
     for r, g, b in ((1, 47, 207), (20, 90, 230), (5, 60, 200)):
         assert classify(r, g, b) == "blue", f"({r},{g},{b}) must still read as blue"
     print("PASS: white-ish tilts are idle, genuine blues still classify as blue")
+
+
+def test_shipped_persistence_settings_are_sane():
+    """Full-cycle tests shrink the confirm thresholds to keep runtimes sane, which means
+    they can NOT catch a bad shipped value. Pin the real ones: the window must span more
+    than one poll interval and be long enough to outlast an animation frame, but short
+    enough that a real fault still halts promptly."""
+    assert cc.ERROR_LIGHT_CONFIRM_SAMPLES >= 3, "too few samples to reject a transient"
+    assert cc.ERROR_LIGHT_CONFIRM_S >= 0.5, "confirm window too short to outlast a frame"
+    assert cc.ERROR_LIGHT_CONFIRM_S <= 3.0, "a real fault must still halt promptly"
+    span = cc.ERROR_LIGHT_CONFIRM_SAMPLES * cc.ERROR_LIGHT_POLL_S
+    assert span <= cc.ERROR_LIGHT_CONFIRM_S * 4, \
+        "sample count and time window must be reachable together"
+    print("PASS: shipped persistence thresholds are within sane bounds")
+
+
+def test_failed_read_breaks_the_fault_run():
+    """A read we never got cannot be part of a run of CONSECUTIVE fault samples.
+    Without this, fault/fail/fault/fail accumulates into a halt that was never held."""
+    import inspect
+    src = inspect.getsource(cc.CycleRunner._error_light_worker)
+    fail_branch = src.split("if rgb is None:")[1].split("else:")[0]
+    assert "pending_color, pending_n = None, 0" in fail_branch, \
+        "a failed read must reset the fault-persistence counter"
+    print("PASS: a failed read breaks the run of consecutive fault samples")
 
 
 def test_a_transient_fault_color_does_not_halt():
@@ -527,12 +557,9 @@ def test_a_held_fault_still_halts():
             if cmd.startswith("GET COLOR ERROR"):
                 return [b"RGB:ERROR:239,16,0\n"]         # RUST, held (as the machine does)
             return super().__call__(cmd)
-    saved_n, saved_s = cc.ERROR_LIGHT_CONFIRM_SAMPLES, cc.ERROR_LIGHT_CONFIRM_S
-    cc.ERROR_LIGHT_CONFIRM_SAMPLES, cc.ERROR_LIGHT_CONFIRM_S = 3, 0.02
-    try:
-        ok, msg = _run_cycle_with_front(HeldFaultFront(), ring_timeout=5)
-    finally:
-        cc.ERROR_LIGHT_CONFIRM_SAMPLES, cc.ERROR_LIGHT_CONFIRM_S = saved_n, saved_s
+    # (no threshold setup here: _run_cycle_with_front owns those, and setting them
+    # around it was dead code that read as if it were controlling the test.)
+    ok, msg = _run_cycle_with_front(HeldFaultFront(), ring_timeout=5)
     assert not ok, msg
     assert "Error light RED" in msg, msg
     assert "held" in msg, f"the halt should say how long it was held: {msg}"
@@ -783,7 +810,7 @@ class BleedFront(FrontBoard):
     is triggered. Starting at gate-open (not gate-close) is the point -- the glow is
     already on the sensor while the gate is moving. `bleed_rgb` lets a test swap in a
     different color to prove only BLUE is suppressed."""
-    def __init__(self, bleed_rgb=b"94,86,255"):
+    def __init__(self, bleed_rgb=b"1,47,207"):
         super().__init__()
         self.bleed_rgb   = bleed_rgb
         self.gate_opened = False
@@ -846,9 +873,25 @@ def test_suppressed_blue_is_not_treated_as_healthy():
     runner = cc.CycleRunner(dm, 0, 5, None)
     runner._error_clear_since = time.time() - 100      # a long-standing idle streak
     assert runner._error_light_confirmed_idle()
+    # Drive the real watcher against a blue reading inside the window and let IT decide,
+    # rather than performing the assignment the production code is supposed to make.
     runner._blue_bleed_window.set()
-    runner._error_clear_since = None                   # what the watcher does on a bleed
-    assert not runner._error_light_confirmed_idle()
+    front = _make_device(lambda _cmd: [b"RGB:ERROR:1,47,207\n"])
+    runner.dev = types.SimpleNamespace(dispenser=None, front=front)
+    stop = threading.Event()
+    saved = cc.ERROR_LIGHT_POLL_S
+    cc.ERROR_LIGHT_POLL_S = 0.005
+    try:
+        w = runner._start_error_watch(stop)
+        runner._blue_bleed_window.set()
+        runner._error_clear_since = time.time() - 100   # pretend a long idle streak
+        time.sleep(0.05)
+        stop.set(); w.join(2)
+    finally:
+        cc.ERROR_LIGHT_POLL_S = saved
+    assert not runner._error_flag.is_set(), "suppressed blue must not halt the run"
+    assert not runner._error_light_confirmed_idle(), \
+        "the watcher must clear the idle streak on a suppressed blue"
     print("PASS: a suppressed blue resets the idle streak instead of confirming health")
 
 
@@ -1005,6 +1048,8 @@ if __name__ == "__main__":
         test_classifies_the_machines_actual_led_colors,
         test_ring_bleed_never_reads_as_the_water_error,
         test_white_ish_readings_are_not_blue,
+        test_shipped_persistence_settings_are_sane,
+        test_failed_read_breaks_the_fault_run,
         test_a_transient_fault_color_does_not_halt,
         test_a_held_fault_still_halts,
         test_blue_needs_all_three_gates,
