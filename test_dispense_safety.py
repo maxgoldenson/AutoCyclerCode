@@ -483,7 +483,16 @@ def test_ring_bleed_never_reads_as_the_water_error():
         assert classify(*rgb) is None, f"ring bleed {rgb} must not read as a fault"
     # ...and the genuine water error still does, including with white spill on top.
     assert classify(1, 47, 207) == "blue"
-    assert classify(20, 90, 230) == "blue", "real fill error under some white spill"
+    assert classify(20, 90, 230) == "blue", "strongly blue reading with a green lean"
+    # ⭐ Pins the gate from ABOVE, which the rest of this table does not. Modelling a real
+    # DODGER_BLUE diluted by light from neighbouring white icons -- alpha*(1,47,207) +
+    # (1-alpha)*(85,85,85) -- every other gate still passes down to alpha ~= 0.62, so the
+    # physically reachable band runs g/r from ~1.85 up. Without an assertion in that band
+    # the discriminator could be tightened 3.5x with the suite still green, and a genuine
+    # water error seen through ~20% white contamination would classify as idle.
+    # (30,60,164) is that mix at alpha = 0.65, g/r = 2.0; it fails for any gate >= 2.0.
+    assert classify(30, 60, 164) == "blue", \
+        "a real fill error diluted ~35% by neighbouring white icons must still classify"
     print("PASS: ring bleed reads as idle, the real water error still halts")
 
 
