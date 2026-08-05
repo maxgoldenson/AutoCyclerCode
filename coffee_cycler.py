@@ -77,7 +77,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-03 19:42"
+VERSION = "2026-08-05 19:48"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -135,8 +135,8 @@ ID_DISPENSER = "DISPENSER"
 ID_FRONT     = "FRONT_ASSEMBLY"
 
 # -- Servo angles (0-180 deg) --------------------------------------------------
-SERVO_REST = 95
-SERVO_OPEN = 135
+SERVO_REST = 48
+SERVO_OPEN = 68
 
 # -- Error light ---------------------------------------------------------------
 # The error light is ALWAYS ON. Its COLOR is the signal, not whether it is lit:
