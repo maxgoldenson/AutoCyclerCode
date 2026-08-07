@@ -36,8 +36,9 @@ exactly one place, reachable only from a requested run -- the cycler never brews
 when it wasn't asked to.
 
 The Machine switch (2.2.x / 3.0) in the CONFIGURATION panel records which machine
-is on the fixture. Both modes currently behave identically; it is the hook for
-the 3.0 ring-timing work.
+is on the fixture. The modes differ only in the brew trigger: 2.2.x uses a
+single short CAP pulse, while 3.0 presses the cap touch three times for 2 s
+each. The rest of the cycle is identical.
 
 Numpad pendant controls (always active):
   8 / 2       navigate up / down between fields
@@ -77,7 +78,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-07-31 21:46"
+VERSION = "2026-08-07 18:34"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -135,8 +136,8 @@ ID_DISPENSER = "DISPENSER"
 ID_FRONT     = "FRONT_ASSEMBLY"
 
 # -- Servo angles (0-180 deg) --------------------------------------------------
-SERVO_REST = 95
-SERVO_OPEN = 135
+SERVO_REST = 48
+SERVO_OPEN = 68
 
 # -- Error light ---------------------------------------------------------------
 # The error light is ALWAYS ON. Its COLOR is the signal, not whether it is lit:
@@ -162,12 +163,33 @@ SERVO_OPEN = 135
 #
 # The behavior above is IDENTICAL on 2.2.x and 3.0 -- nothing in the error-light path
 # consults the machine mode (pinned by test_error_light_is_identical_in_both_modes).
+# ⭐ Ground truth, read out of the MACHINE's own firmware (uiux.c / serial_led.c) rather
+# than guessed. The error light is the "Maintainance" status icon, and these are the ONLY
+# colors it is ever set to, converted through the firmware's gamma table into the
+# chromaticity this sensor actually reports:
+#
+#   machine state                         LED color          sensor sees    fault?
+#   Error / WaterLeak / CriticalFault     RUST               (239, 16,  0)   YES
+#   Warning                               SCHOOL_BUS_YELLOW  (161, 94,  0)   YES
+#   FillingError  (the water error)       DODGER_BLUE        (  1, 47,207)   YES
+#   UserErrorIndicator (attention)        WHITE, flashing    ( 85, 85, 85)   no
+#   ...Success                            GREEN              (  0,255,  0)   no
+#   idle                                  WHITE / OFF        ( 85, 85, 85)   no
+#
+# Two things follow that the old thresholds got wrong:
+#
+# 1. GREEN on this sensor is the SUCCESS state, not a channel mix-up. Never treat it as
+#    a fault, and never report it as evidence of swapped mux channels.
+# 2. Yellow must be tested BEFORE red. SCHOOL_BUS_YELLOW lands at (161,94,0), and with a
+#    60-wide red/green window that missed the yellow rule and fell through to red — the
+#    run still halted, but the operator was told the wrong thing. The window is 90 now,
+#    which separates yellow (|r-g| = 67) from RUST (|r-g| = 223).
 ERROR_LIGHT_WHITE_MAX_SPREAD = 45   # max(r,g,b)-min(r,g,b) at/below this = idle white
 ERROR_LIGHT_RED_R_OVER_G     = 1.6
 ERROR_LIGHT_RED_R_OVER_B     = 1.6
 ERROR_LIGHT_YELLOW_R_OVER_B  = 1.6
 ERROR_LIGHT_YELLOW_G_OVER_B  = 1.6
-ERROR_LIGHT_YELLOW_RG_DIFF   = 60   # red and green comparable => yellow, not red
+ERROR_LIGHT_YELLOW_RG_DIFF   = 90   # red and green comparable => yellow, not red
 # Blue is the fault color a white-ish reading fakes most easily, and it was doing so:
 # ambient light and the ring's glow both tilt the sensor slightly blue without the error
 # light having changed at all. Neutral chromaticity is r≈g≈b≈85, so a mild tilt like
@@ -184,14 +206,44 @@ ERROR_LIGHT_YELLOW_RG_DIFF   = 60   # red and green comparable => yellow, not re
 # A blue that misses these is logged with all three metrics (see the unclassified
 # branch), so tuning against a real machine needs no extra instrumentation.
 ERROR_LIGHT_BLUE_B_OVER_R    = 2.0
-ERROR_LIGHT_BLUE_B_OVER_G    = 2.0
 ERROR_LIGHT_BLUE_MIN_B       = 160
 ERROR_LIGHT_BLUE_MIN_SHARE   = 0.50
+# ⭐ The bleed discriminator, and the reason blue mistriggered for so long.
+#
+# The ring sits right next to this sensor and its "press start" state (ReadyStartCup, the
+# very state the fixture waits in) lights all 24 LEDs PURE_BLUE — so mid-cycle the sensor
+# reads the neighbouring WHITE status icons plus blue spill from the ring. White adds red
+# and green in equal measure, so the bleed always lands at g ~= r:
+#
+#   real fill error   DODGER_BLUE   (  1, 47,207)   g/r = 47      <- g FAR above r
+#   ring bleed        white+blue    ( 94, 86,255)   g/r = 0.91    <- g level with r
+#
+# Requiring g > r * 1.25 keeps the real water error and rejects the bleed, and it holds
+# across every white/blue mix ratio: more white raises r and g together, less white drops
+# both toward zero (pure spill reads (0,0,255), where g > r*1.25 is false). No brightness
+# or blueness threshold can separate these two — only the red/green relationship can.
+ERROR_LIGHT_BLUE_G_OVER_R    = 1.25
+# ...and an ABSOLUTE floor on the same gap, because the ratio degenerates exactly where
+# the bleed is worst. The Brew icon BLINKS, so white content falls toward zero on every
+# off-phase; at that point r is a couple of counts of sensor noise and "g > r * 1.25"
+# becomes meaningless -- (1,2,255) passes it. A real fill error clears this comfortably
+# (DODGER_BLUE gives g-r = 46) while every white+blue mix is negative or near zero.
+ERROR_LIGHT_BLUE_GR_MARGIN   = 15
 ERROR_LIGHT_FAULT_COLORS = ("red", "yellow", "blue")
 ERROR_LIGHT_POLL_S    = 0.2   # sample interval — several samples per flash period
 ERROR_LIGHT_CLEAR_S   = 1.6   # pre-flight observation window (> one full 1 Hz period)
 ERROR_LIGHT_MAX_FAILS = 15    # consecutive unreadable samples (~3 s) before halting:
                               # a blind error detector is worse than no run at all
+# ⭐ PERSISTENCE — the single biggest anti-mistrigger lever, and it is nearly free here.
+# Every real fault on this icon is a STATIC hold in the machine firmware: Error,
+# WaterLeak, Warning, CriticalFault and FillingError all stop the animation timer and
+# leave the LED lit. A genuine fault therefore reads the SAME color on every sample,
+# indefinitely. Anything that appears for a moment and goes away is by definition not one
+# of them — it is a ring animation frame, a fade, or a sensor glitch.
+# So a fault must be seen on consecutive samples spanning a real stretch of time before
+# it halts a run. Costs ~1 s of detection latency on a machine that has already stopped.
+ERROR_LIGHT_CONFIRM_SAMPLES = 5     # consecutive readings of the SAME fault color...
+ERROR_LIGHT_CONFIRM_S       = 1.0   # ...spanning at least this long
 
 # -- Blue-ring disambiguation --------------------------------------------------
 # A blue RING means either "time to go" (idle, ready to brew) or a water error. The
@@ -238,6 +290,12 @@ RING_WARN_YELLOW_RG_DIFF  = 60
 DEFAULT_RING_WAIT_MIN_S = 45
 DEFAULT_RING_TIMEOUT_S  = 120
 CAP_PULSE_S             = 0.5
+# 3.0 machines need the brew button held longer and pressed repeatedly: three
+# 2 s presses with a short release in between. 2.2.x keeps the single short
+# pulse above. Each 2 s hold is well inside the firmware's 15 s CAP failsafe.
+CAP_PULSE_S_30          = 2.0
+CAP_PULSE_COUNT_30      = 3
+CAP_PULSE_GAP_S_30      = 0.5
 
 # -- Pre-start checklist -------------------------------------------------------
 PRESTART_CHECKS = [
@@ -665,9 +723,9 @@ class CycleRunner:
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
         self.skip_dispense   = skip_dispense
-        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. It records
-        # WHICH machine is on the fixture; both modes currently run identically. It is
-        # the hook for the 3.0 ring-timing work, so keep it wired through.
+        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. The mode
+        # selects the brew-trigger pattern in _trigger_brew (2.2.x: one short pulse;
+        # 3.0: three 2 s presses); the rest of the cycle is the same in both modes.
         self.machine         = machine
         self._green_seen  = False
         self._cycle_count = 0
@@ -735,13 +793,15 @@ class CycleRunner:
         show would be a worse failure than missing it."""
         if (max(r, g, b) - min(r, g, b)) <= ERROR_LIGHT_WHITE_MAX_SPREAD:
             return None                      # idle white -- the machine is fine
-        if (r > g * ERROR_LIGHT_RED_R_OVER_G
-                and r > b * ERROR_LIGHT_RED_R_OVER_B):
-            return "red"
+        # Yellow BEFORE red: SCHOOL_BUS_YELLOW reads (161,94,0), which also satisfies the
+        # red rule. Red-first mislabelled every machine Warning as an error.
         if (r > b * ERROR_LIGHT_YELLOW_R_OVER_B
                 and g > b * ERROR_LIGHT_YELLOW_G_OVER_B
                 and abs(r - g) <= ERROR_LIGHT_YELLOW_RG_DIFF):
             return "yellow"
+        if (r > g * ERROR_LIGHT_RED_R_OVER_G
+                and r > b * ERROR_LIGHT_RED_R_OVER_B):
+            return "red"
         dominant, bright, pure, _share = CycleRunner._blue_metrics(r, g, b)
         if dominant and bright and pure:
             return "blue"
@@ -756,7 +816,9 @@ class CycleRunner:
         error, so the tuning data has to be in the log by default, not behind a rebuild."""
         total = max(1, r + g + b)
         share = b / total
-        return (b > r * ERROR_LIGHT_BLUE_B_OVER_R and b > g * ERROR_LIGHT_BLUE_B_OVER_G,
+        return (b > r * ERROR_LIGHT_BLUE_B_OVER_R
+                and g > r * ERROR_LIGHT_BLUE_G_OVER_R
+                and (g - r) >= ERROR_LIGHT_BLUE_GR_MARGIN,
                 b >= ERROR_LIGHT_BLUE_MIN_B,
                 share >= ERROR_LIGHT_BLUE_MIN_SHARE,
                 share)
@@ -792,6 +854,7 @@ class CycleRunner:
         f     = self.dev.front
         fails = 0
         reason = ""     # last thing the board said instead of an RGB reading
+        pending_color, pending_since, pending_n = None, 0.0, 0   # fault-persistence state
         while not stop_flag.is_set() and not self._error_flag.is_set():
             rgb  = None
             resp = ""
@@ -808,8 +871,12 @@ class CycleRunner:
             if rgb is None:
                 fails += 1
                 # Lost sight of the light — that is not evidence it is healthy, so
-                # the "confirmed idle" streak has to start over.
+                # the "confirmed idle" streak has to start over. The fault run breaks
+                # too: a read we never got cannot be part of a run of CONSECUTIVE fault
+                # samples, and letting fault/fail/fault accumulate would confirm a fault
+                # that was never actually held.
                 self._error_clear_since = None
+                pending_color, pending_n = None, 0
                 if resp:
                     reason = resp
                 if fails >= ERROR_LIGHT_MAX_FAILS:
@@ -832,18 +899,47 @@ class CycleRunner:
                     # idle streak so nothing downstream treats this as an all-clear.
                     print(f"[errlight] blue ignored (ring ready-glow bleed) "
                           f"R={r} G={g} B={b}")
+                    pending_color, pending_n = None, 0
                     self._error_clear_since = None
                     stop_flag.wait(ERROR_LIGHT_POLL_S)
                     continue
                 if color in ERROR_LIGHT_FAULT_COLORS:
-                    self._flag_error(f"Error light {color.upper()} -- "
-                                     f"R={r} G={g} B={b}")
-                    return
+                    # PERSISTENCE: every real fault on this icon is a static hold, so it
+                    # reads the same color on every sample. A color that comes and goes is
+                    # a ring animation frame or a glitch, and must not halt a run.
+                    now = time.time()
+                    if color != pending_color:
+                        pending_color, pending_since, pending_n = color, now, 1
+                    else:
+                        pending_n += 1
+                    if (pending_n >= ERROR_LIGHT_CONFIRM_SAMPLES
+                            and (now - pending_since) >= ERROR_LIGHT_CONFIRM_S):
+                        self._flag_error(
+                            f"Error light {color.upper()} -- R={r} G={g} B={b} "
+                            f"(held {pending_n} samples / "
+                            f"{now - pending_since:.1f}s)")
+                        return
+                    print(f"[errlight] {color} seen ({pending_n}/"
+                          f"{ERROR_LIGHT_CONFIRM_SAMPLES}) R={r} G={g} B={b} "
+                          f"-- awaiting confirmation")
+                    self._error_clear_since = None   # not healthy while a fault is pending
+                    stop_flag.wait(ERROR_LIGHT_POLL_S)
+                    continue
+                pending_color, pending_n = None, 0    # fault did not persist
                 spread = max(rgb) - min(rgb)
                 if spread > ERROR_LIGHT_WHITE_MAX_SPREAD:
                     # Saturated but not one of the three fault colors. Not halting on it
                     # (see _classify_error_light), but it should never happen — log it
                     # loudly so the thresholds can be tuned against a real reading.
+                    if self._classify_ring_color(r, g, b) == "green":
+                        # GREEN is the machine's SUCCESS state on this icon
+                        # (UserErrorIndicator_Success) -- expected, not noise.
+                        print(f"[errlight] green (machine success indicator) "
+                              f"R={r} G={g} B={b}")
+                        if self._error_clear_since is None:
+                            self._error_clear_since = time.time()
+                        stop_flag.wait(ERROR_LIGHT_POLL_S)
+                        continue
                     hint = ""
                     dominant, bright, pure, share = self._blue_metrics(r, g, b)
                     if dominant or bright or pure:
@@ -851,18 +947,12 @@ class CycleRunner:
                         # the numbers: this is the line to tune ERROR_LIGHT_BLUE_* from,
                         # and a REAL blue landing here is a water error going unhalted.
                         missed = ", ".join(n for n, ok in (
-                            (f"dominance(<{ERROR_LIGHT_BLUE_B_OVER_R}x)", dominant),
+                            (f"dominance(b<{ERROR_LIGHT_BLUE_B_OVER_R}xr or g<{ERROR_LIGHT_BLUE_G_OVER_R}xr)", dominant),
                             (f"magnitude(<{ERROR_LIGHT_BLUE_MIN_B})", bright),
                             (f"purity(<{ERROR_LIGHT_BLUE_MIN_SHARE})", pure)) if not ok)
                         hint = (f"  [blue-ish: b/r={b / max(1, r):.2f} "
                                 f"b/g={b / max(1, g):.2f} share={share:.2f}; "
                                 f"failed {missed}]")
-                    if self._classify_ring_color(r, g, b) == "green":
-                        # The error light has no green state; the RING does, at brew
-                        # completion. Seeing green here means this channel is looking at
-                        # the ring — a swapped MUX_CH_* assignment or miswired cover.
-                        hint = ("  <-- GREEN on the error channel: the error light has "
-                                "no green state. MUX channels are probably SWAPPED.")
                     print(f"[errlight] unclassified color R={r} G={g} B={b} "
                           f"(spread {spread}) -- treating as idle{hint}")
                 if self._error_clear_since is None:
@@ -1082,19 +1172,30 @@ class CycleRunner:
         may ever be called from idle/discovery paths: the cycler must never brew when
         it wasn't asked to."""
         f = self.dev.front
-        resp_cap = f.send("SET CAP ON", expect="CAP:")
-        # Brew triggered: the ring leaves its blue ready state, so the bleed window is
-        # over and a blue error light means a real water error again.
-        self._blue_bleed_window.clear()
-        self._last_trigger_time = time.time()
-        print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
-        if not _sleep(CAP_PULSE_S, stop_flag):
-            f.send("SET CAP OFF", expect="CAP:")
-            return self._abort_reason()
-        resp_cap = f.send("SET CAP OFF", expect="CAP:")
-        print(f"[serial] SET CAP OFF -> {resp_cap!r}")
+        # 2.2.x: one short pulse. 3.0: three 2 s presses with a short release between
+        # them -- the 3.0 machine needs the longer, repeated touch to register.
+        if self.machine == "3.0":
+            pulses, pulse_s = CAP_PULSE_COUNT_30, CAP_PULSE_S_30
+        else:
+            pulses, pulse_s = 1, CAP_PULSE_S
+        for i in range(pulses):
+            resp_cap = f.send("SET CAP ON", expect="CAP:")
+            if i == 0:
+                # Brew triggered: the ring leaves its blue ready state, so the bleed
+                # window is over and a blue error light means a real water error again.
+                self._blue_bleed_window.clear()
+                self._last_trigger_time = time.time()
+            print(f"[serial] SET CAP ON -> {resp_cap!r}  "
+                  f"(pulse {pulse_s}s, {i + 1}/{pulses})")
+            if not _sleep(pulse_s, stop_flag):
+                f.send("SET CAP OFF", expect="CAP:")
+                return self._abort_reason()
+            resp_cap = f.send("SET CAP OFF", expect="CAP:")
+            print(f"[serial] SET CAP OFF -> {resp_cap!r}")
+            if i < pulses - 1 and not _sleep(CAP_PULSE_GAP_S_30, stop_flag):
+                return self._abort_reason()
         if not self._step(4, "Brew triggered", status_cb, stop_flag,
-                          elapsed=CAP_PULSE_S, hold=1.5):
+                          elapsed=pulses * pulse_s, hold=1.5):
             return self._abort_reason()
         return None
 

@@ -46,7 +46,7 @@
 // ── Firmware version ───────────────────────────────────────────────────────────
 // The launcher flashes the board ONLY when this string changes — so editing comments
 // or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
-#define FW_VERSION "2026-07-31.2"
+#define FW_VERSION "2026-08-05.1"
 
 // ── MUX config ─────────────────────────────────────────────────────────────────
 #define PCA9548A_ADDR 0x70
@@ -97,7 +97,7 @@ Servo myServo;
 // be held pressed indefinitely. Set well above the longest legitimate hold — the
 // host's 10s reset hold — so a real operation is never cut short.
 #define CAP_MAX_ON_MS 15000UL
-#define SERVO_REST_DEG 95   // safe "gate closed" position to assume on boot
+#define SERVO_REST_DEG 48   // safe "gate closed" position to assume on boot
 
 // ── State ──────────────────────────────────────────────────────────────────────
 bool capActive = false;
