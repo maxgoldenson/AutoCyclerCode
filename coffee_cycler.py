@@ -36,8 +36,9 @@ exactly one place, reachable only from a requested run -- the cycler never brews
 when it wasn't asked to.
 
 The Machine switch (2.2.x / 3.0) in the CONFIGURATION panel records which machine
-is on the fixture. Both modes currently behave identically; it is the hook for
-the 3.0 ring-timing work.
+is on the fixture. The modes differ only in the brew trigger: 2.2.x uses a
+single short CAP pulse, while 3.0 presses the cap touch three times for 2 s
+each. The rest of the cycle is identical.
 
 Numpad pendant controls (always active):
   8 / 2       navigate up / down between fields
@@ -77,7 +78,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-05 19:48"
+VERSION = "2026-08-07 18:34"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -289,6 +290,12 @@ RING_WARN_YELLOW_RG_DIFF  = 60
 DEFAULT_RING_WAIT_MIN_S = 45
 DEFAULT_RING_TIMEOUT_S  = 120
 CAP_PULSE_S             = 0.5
+# 3.0 machines need the brew button held longer and pressed repeatedly: three
+# 2 s presses with a short release in between. 2.2.x keeps the single short
+# pulse above. Each 2 s hold is well inside the firmware's 15 s CAP failsafe.
+CAP_PULSE_S_30          = 2.0
+CAP_PULSE_COUNT_30      = 3
+CAP_PULSE_GAP_S_30      = 0.5
 
 # -- Pre-start checklist -------------------------------------------------------
 PRESTART_CHECKS = [
@@ -716,9 +723,9 @@ class CycleRunner:
         self.ring_timeout    = ring_timeout
         self.ring_warning_cb = ring_warning_cb
         self.skip_dispense   = skip_dispense
-        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. It records
-        # WHICH machine is on the fixture; both modes currently run identically. It is
-        # the hook for the 3.0 ring-timing work, so keep it wired through.
+        # "2.2" or "3.0" -- the machine under test, chosen by the UI switch. The mode
+        # selects the brew-trigger pattern in _trigger_brew (2.2.x: one short pulse;
+        # 3.0: three 2 s presses); the rest of the cycle is the same in both modes.
         self.machine         = machine
         self._green_seen  = False
         self._cycle_count = 0
@@ -1165,19 +1172,30 @@ class CycleRunner:
         may ever be called from idle/discovery paths: the cycler must never brew when
         it wasn't asked to."""
         f = self.dev.front
-        resp_cap = f.send("SET CAP ON", expect="CAP:")
-        # Brew triggered: the ring leaves its blue ready state, so the bleed window is
-        # over and a blue error light means a real water error again.
-        self._blue_bleed_window.clear()
-        self._last_trigger_time = time.time()
-        print(f"[serial] SET CAP ON -> {resp_cap!r}  (pulse {CAP_PULSE_S}s)")
-        if not _sleep(CAP_PULSE_S, stop_flag):
-            f.send("SET CAP OFF", expect="CAP:")
-            return self._abort_reason()
-        resp_cap = f.send("SET CAP OFF", expect="CAP:")
-        print(f"[serial] SET CAP OFF -> {resp_cap!r}")
+        # 2.2.x: one short pulse. 3.0: three 2 s presses with a short release between
+        # them -- the 3.0 machine needs the longer, repeated touch to register.
+        if self.machine == "3.0":
+            pulses, pulse_s = CAP_PULSE_COUNT_30, CAP_PULSE_S_30
+        else:
+            pulses, pulse_s = 1, CAP_PULSE_S
+        for i in range(pulses):
+            resp_cap = f.send("SET CAP ON", expect="CAP:")
+            if i == 0:
+                # Brew triggered: the ring leaves its blue ready state, so the bleed
+                # window is over and a blue error light means a real water error again.
+                self._blue_bleed_window.clear()
+                self._last_trigger_time = time.time()
+            print(f"[serial] SET CAP ON -> {resp_cap!r}  "
+                  f"(pulse {pulse_s}s, {i + 1}/{pulses})")
+            if not _sleep(pulse_s, stop_flag):
+                f.send("SET CAP OFF", expect="CAP:")
+                return self._abort_reason()
+            resp_cap = f.send("SET CAP OFF", expect="CAP:")
+            print(f"[serial] SET CAP OFF -> {resp_cap!r}")
+            if i < pulses - 1 and not _sleep(CAP_PULSE_GAP_S_30, stop_flag):
+                return self._abort_reason()
         if not self._step(4, "Brew triggered", status_cb, stop_flag,
-                          elapsed=CAP_PULSE_S, hold=1.5):
+                          elapsed=pulses * pulse_s, hold=1.5):
             return self._abort_reason()
         return None
 

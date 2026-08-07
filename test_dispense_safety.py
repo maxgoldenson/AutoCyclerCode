@@ -371,12 +371,32 @@ def test_mode_22_order_dispense_door_cap():
 
 
 def test_mode_30_runs_the_same_op_order_as_22():
-    """3.0 must NOT reorder the cycle -- it cycles exactly like 2.2.x."""
+    """3.0 must NOT reorder the cycle -- it differs from 2.2.x only in the brew
+    trigger, which presses the cap touch CAP_PULSE_COUNT_30 times instead of once."""
     _ok22, msg22, ev22 = _run_logged_cycle("2.2")
     _ok30, msg30, ev30 = _run_logged_cycle("3.0")
     assert _ok22 and _ok30, (msg22, msg30)
-    assert ev22 == ev30, (ev22, ev30)
-    print("PASS: 3.0 runs the same command sequence as 2.2.x")
+    # Collapse 3.0's extra ON/OFF pulse pairs down to one; everything else must
+    # match 2.2.x exactly.
+    i = _first_index(ev30, "SET CAP ON")
+    extra = ["SET CAP ON", "SET CAP OFF"] * (cc.CAP_PULSE_COUNT_30 - 1)
+    assert ev30[i + 2:i + 2 + len(extra)] == extra, ev30
+    collapsed = ev30[:i + 2] + ev30[i + 2 + len(extra):]
+    assert ev22 == collapsed, (ev22, collapsed)
+    print("PASS: 3.0 matches 2.2.x except for the triple cap-touch press")
+
+
+def test_mode_30_presses_cap_three_times_for_two_seconds():
+    """3.0 must hold CAP for CAP_PULSE_S_30 on each of its three presses; 2.2.x
+    keeps its single short pulse."""
+    assert cc.CAP_PULSE_COUNT_30 == 3 and cc.CAP_PULSE_S_30 == 2.0
+    _ok, msg, ev = _run_logged_cycle("3.0")
+    assert _ok, msg
+    assert ev.count("SET CAP ON") == 3, ev
+    _ok, msg, ev = _run_logged_cycle("2.2")
+    assert _ok, msg
+    assert ev.count("SET CAP ON") == 1, ev
+    print("PASS: 3.0 presses cap 3x for 2s each; 2.2.x presses once")
 
 
 def test_machine_mode_defaults_to_22():
@@ -1049,6 +1069,7 @@ if __name__ == "__main__":
         test_skip_dispense_off_by_default_still_dispenses,
         test_mode_22_order_dispense_door_cap,
         test_mode_30_runs_the_same_op_order_as_22,
+        test_mode_30_presses_cap_three_times_for_two_seconds,
         test_machine_mode_defaults_to_22,
         test_blue_ring_never_warns_in_either_mode,
         test_blue_ring_does_not_block_green,
