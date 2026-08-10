@@ -78,7 +78,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-10 22:20"
+VERSION = "2026-08-10 22:39"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -275,6 +275,15 @@ RING_RETRIGGER_MAX   = 2     # brew re-triggers per cycle before giving up; a ma
                              # by more pulses, and hammering the button is a hazard
 
 # -- Ring sensor color thresholds ---------------------------------------------
+# FIRST CYCLE ONLY: the ready cue is accepted from ANY ring reading that is not
+# white-ish (channel spread above this), not just a strict blue. The first cycle of a
+# sequence keeps missing the strict blue match (the machine's ring can come out of a
+# long idle mid-animation / dimmed, diluting the b/r and b/g ratios) while later
+# cycles, entered fresh off a brew, read clean PURE_BLUE. Relaxing here is safe in a
+# way it is NOT for the error light: this cue only decides when to press the brew
+# button, the error-light watcher still halts on any real fault, and a wrong "ready"
+# self-corrects through the retrigger path. Cycles 2+ keep the strict classifier.
+RING_FIRST_CYCLE_WHITE_SPREAD = 45
 RING_GREEN_MIN_G          = 40
 RING_GREEN_G_OVER_R       = 1.8
 RING_GREEN_G_OVER_B       = 1.8
@@ -766,12 +775,26 @@ class CycleRunner:
             rgb = _parse_rgb(resp, "RING")
             if rgb is not None:
                 r, g, b = rgb
-                color = self._classify_ring_color(r, g, b)
-                print(f"[blue-wait] R={r} G={g} B={b} -> {color}")
-                if color == "blue":
+                if self._ring_is_ready_cue(r, g, b):
                     return True
         print(f"[blue-wait] no blue after {timeout}s, proceeding")
         return True
+
+    def _ring_is_ready_cue(self, r, g, b) -> bool:
+        """Is this ring reading the machine's 'time to go' cue? Strict blue always
+        counts. On the FIRST cycle of a sequence, any non-white-ish reading counts too
+        (see the RING_FIRST_CYCLE_WHITE_SPREAD notes) -- this cue only gates the brew
+        button press, so the relaxed match can cost a retrigger, never a missed fault."""
+        color = self._classify_ring_color(r, g, b)
+        print(f"[blue-wait] R={r} G={g} B={b} -> {color}")
+        if color == "blue":
+            return True
+        if (self._cycle_count == 1
+                and (max(r, g, b) - min(r, g, b)) > RING_FIRST_CYCLE_WHITE_SPREAD):
+            print(f"[blue-wait] first cycle: non-white reading accepted as ready "
+                  f"(R={r} G={g} B={b}, classified {color})")
+            return True
+        return False
 
     # -- Error-light watch ----------------------------------------------------
     # A background reader samples the error light for the WHOLE cycle rather than once

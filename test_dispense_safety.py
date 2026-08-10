@@ -451,6 +451,27 @@ def test_blue_ring_does_not_block_green():
     print("PASS: green after blue is still detected")
 
 
+def test_first_cycle_ready_cue_is_relaxed():
+    """On the FIRST cycle only, any non-white-ish ring reading counts as the 'ready'
+    cue -- the machine's ring keeps coming out of a long idle dimmed / mid-animation,
+    missing the strict blue ratios and stalling the start of the sequence. Cycles 2+
+    keep the strict classifier, and white-ish never counts on any cycle."""
+    dm = types.SimpleNamespace(dispenser=None, front=None)
+    runner = cc.CycleRunner(dm, 0, 5, None)
+    weak_blue = (100, 100, 150)   # spread 50: plainly not white, misses the 1.5x ratios
+    assert cc.CycleRunner._classify_ring_color(runner, *weak_blue) != "blue"
+
+    runner._cycle_count = 1
+    assert runner._ring_is_ready_cue(*weak_blue)          # relaxed: accepted
+    assert not runner._ring_is_ready_cue(85, 85, 85)      # white-ish: never ready
+    assert runner._ring_is_ready_cue(10, 10, 220)         # strict blue: still ready
+
+    runner._cycle_count = 2
+    assert not runner._ring_is_ready_cue(*weak_blue)      # later cycles: strict only
+    assert runner._ring_is_ready_cue(10, 10, 220)
+    print("PASS: first-cycle ready cue relaxed to non-white; strict from cycle 2 on")
+
+
 def test_orange_ring_still_prompts_the_operator():
     """The orange/yellow prompt stays as a second net alongside the error light."""
     outcome, detail = _ring_outcome("3.0", [b"RGB:220,60,10\n"], ring_timeout=5)
@@ -1085,7 +1106,9 @@ if __name__ == "__main__":
         test_mode_30_runs_the_same_op_order_as_22,
         test_mode_30_presses_cap_three_times_for_two_seconds,
         test_machine_mode_defaults_to_22,
+        test_cycle_starts_gate_closed_before_dispensing,
         test_blue_ring_never_warns_in_either_mode,
+        test_first_cycle_ready_cue_is_relaxed,
         test_blue_ring_does_not_block_green,
         test_orange_ring_still_prompts_the_operator,
         test_error_light_classifies_fault_colors_not_brightness,
