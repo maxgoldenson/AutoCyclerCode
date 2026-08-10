@@ -78,7 +78,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-07 18:34"
+VERSION = "2026-08-10 22:20"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1203,8 +1203,18 @@ class CycleRunner:
         self._cycle_count += 1
         f = self.dev.front
 
-        # Guarantee CAP is high-impedance at the start of every cycle
+        # Guarantee CAP is high-impedance AND the gate closed at the start of every
+        # cycle. The idle resting state parks the gate OPEN (_set_idle_gate / connect),
+        # so without the close the FIRST cycle of a run dispenses straight through the
+        # open gate: the coffee reaches the machine during the dispense step, ~15 s
+        # before the door op, and its blue "time to go" ready window starts — and can
+        # expire — before _wait_for_blue ever polls for it. Cycles 2+ never saw this
+        # because _safe_hardware ends every cycle gate-closed; this puts cycle 1 on
+        # that same path (stage on the closed gate, drop at _door_cycle). The pre-flight
+        # error watch runs before the dispense, so the servo has settled long before
+        # any coffee moves.
         f.send("SET CAP OFF", expect="CAP:")
+        f.send(f"SET SERVO {SERVO_REST}", expect="SERVO:")
 
         # Both machine modes run this order: pre-flight error check, dispense, door
         # cycle. 3.0 deliberately does NOT reorder the ops. They stay extracted so a

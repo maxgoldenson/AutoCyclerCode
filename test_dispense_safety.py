@@ -352,22 +352,36 @@ def _run_logged_cycle(machine: str):
     return ok, msg, events
 
 
-def _first_index(events, prefix):
+def _first_index(events, prefix, after=-1):
     for i, e in enumerate(events):
-        if e.startswith(prefix):
+        if i > after and e.startswith(prefix):
             return i
-    raise AssertionError(f"{prefix!r} never sent; log: {events}")
+    raise AssertionError(f"{prefix!r} never sent after index {after}; log: {events}")
 
 
 def test_mode_22_order_dispense_door_cap():
     ok, msg, ev = _run_logged_cycle("2.2")
     assert ok, msg
+    open_idx = _first_index(ev, f"SET SERVO {cc.SERVO_OPEN}")
     order = [_first_index(ev, "SET ANGLE"),
-             _first_index(ev, f"SET SERVO {cc.SERVO_OPEN}"),
-             _first_index(ev, f"SET SERVO {cc.SERVO_REST}"),
+             open_idx,
+             _first_index(ev, f"SET SERVO {cc.SERVO_REST}", after=open_idx),
              _first_index(ev, "SET CAP ON")]
     assert order == sorted(order), (order, ev)
     print("PASS: 2.2.x order -- dispense, door open/close, cap")
+
+
+def test_cycle_starts_gate_closed_before_dispensing():
+    """Idle parks the gate OPEN, so the first cycle of a run used to dispense straight
+    through it -- the coffee hit the machine during the dispense step, its blue ready
+    window started (and could expire) before _wait_for_blue polled, and the start cue
+    was missed. Every cycle must close the gate before any coffee moves."""
+    ok, msg, ev = _run_logged_cycle("2.2")
+    assert ok, msg
+    close_idx = _first_index(ev, f"SET SERVO {cc.SERVO_REST}")
+    angle_idx = _first_index(ev, "SET ANGLE")
+    assert close_idx < angle_idx, (close_idx, angle_idx, ev)
+    print("PASS: gate closed at cycle start, before the dispense")
 
 
 def test_mode_30_runs_the_same_op_order_as_22():
