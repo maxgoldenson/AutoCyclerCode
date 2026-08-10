@@ -5,8 +5,10 @@
  *
  *  GET COLOR ERROR        → RGB:<r>,<g>,<b>   (Error sensor, MUX ch 1)
  *  GET COLOR RING         → RGB:<r>,<g>,<b>   (Ring sensor,  MUX ch 0)
- *  GET COLOR ERROR LED    → RGB:...  (keeps LED on after read)
- *  GET COLOR RING  LED    → RGB:...  (keeps LED on after read)
+ *  GET COLOR <s> LED      → RGB:...  (legacy argument, accepted but IGNORED: the
+ *                           illumination LED never lights in this version -- its
+ *                           bounce off the semi-reflective panel dominated the
+ *                           sensors; see handleGetColor)
  *  GET COLOR <s> TAG      → RGB:<SENSOR>:<r>,<g>,<b>  (names the sensor it read;
  *                           both sensors share address 0x29, so the tag is the only
  *                           way a host can prove which one answered)
@@ -24,7 +26,8 @@
  *    ERROR:door cover not detected (no I2C mux)
  *    ERROR:color sensor not responding
  *    ERROR:color sensor init failed
- *    ERROR:zero clear channel      (cover present, but no light reaching it)
+ *  A verified sensor that sees no light answers RGB:0,0,0 -- with the illumination
+ *  LED off, DARK IS DATA (an unlit indicator), not a fault.
  * ──────────────────────────────────────────────────────────────────────────────
  */
 
@@ -46,7 +49,7 @@
 // ── Firmware version ───────────────────────────────────────────────────────────
 // The launcher flashes the board ONLY when this string changes — so editing comments
 // or whitespace never triggers a fleet-wide re-flash. Bump it on any FUNCTIONAL change.
-#define FW_VERSION "2026-08-05.1"
+#define FW_VERSION "2026-08-10.1"
 
 // ── MUX config ─────────────────────────────────────────────────────────────────
 #define PCA9548A_ADDR 0x70
@@ -204,11 +207,13 @@ const char *readColor(uint8_t ch, uint8_t &r, uint8_t &g, uint8_t &b) {
   uint16_t raw_r, raw_g, raw_b, raw_c;
   tcs.getRawData(&raw_r, &raw_g, &raw_b, &raw_c);
   if (raw_c == 0) {
-    // Present a moment ago but returning nothing: either genuinely pitch dark, or the
-    // cover was pulled between the check above and this read. Force a full re-init next
-    // time so a replug recovers on its own rather than latching a dead sensor.
-    sensorConfigured[ch] = false;
-    return "zero clear channel";
+    // With the illumination LED off, a zero clear channel is a real measurement: the
+    // indicator under this sensor is simply unlit. ensureSensor already proved the
+    // chip is present, configured and integrating (the ENABLE check catches a
+    // power-cycled replug returning zeros), so report dark as data. The host reads
+    // (0,0,0) as spread-zero neutral -- an unlit icon is the machine's healthy idle.
+    r = g = b = 0;
+    return nullptr;
   }
   r = (uint8_t)constrain((raw_r * 255UL) / raw_c, 0, 255);
   g = (uint8_t)constrain((raw_g * 255UL) / raw_c, 0, 255);
@@ -274,8 +279,14 @@ void handleGetColor(const String &args) {
   bool ledArg = (tail.indexOf("LED") >= 0);
   bool tagArg = (tail.indexOf("TAG") >= 0);
 
-  digitalWrite(LED_PIN, HIGH);
-  delay(60);
+  // The illumination LED NEVER lights in this version. Both sensors watch EMISSIVE
+  // indicator LEDs (the ring glow, the error icon), and the white LED sits against a
+  // semi-reflective surface -- its bounce can dominate the reading, dragging every
+  // ratio toward neutral, and strobing it 60 ms per poll washed out fast-following
+  // reads on the other sensor mid-integration. The legacy LED argument is accepted
+  // but ignored, so an older host sending it changes nothing.
+  digitalWrite(LED_PIN, LOW);
+  (void)ledArg;
 
   uint8_t r, g, b;
   const char *err = readColor(channel, r, g, b);
@@ -297,7 +308,6 @@ void handleGetColor(const String &args) {
     Serial.println(err);
   }
 
-  if (!ledArg) digitalWrite(LED_PIN, LOW);
 }
 
 void handleSetServo(const String &args) {

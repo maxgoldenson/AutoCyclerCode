@@ -78,7 +78,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-10 22:39"
+VERSION = "2026-08-10 22:52"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -175,6 +175,14 @@ SERVO_OPEN = 68
 #   UserErrorIndicator (attention)        WHITE, flashing    ( 85, 85, 85)   no
 #   ...Success                            GREEN              (  0,255,  0)   no
 #   idle                                  WHITE / OFF        ( 85, 85, 85)   no
+#
+# CALIBRATION BASIS (FW 2026-08-10.1): reads are taken with the board's illumination
+# LED permanently OFF. The LED sat against a semi-reflective surface, so its white
+# bounce could be MOST of what the sensor saw, dragging readings toward neutral and
+# away from the table above. These thresholds assume the sensor sees only the icon's
+# own emission -- which is exactly what the machine-firmware chromaticities describe.
+# A fully unlit icon now arrives as (0,0,0): spread zero, classified idle, which is
+# correct -- the machine's idle state is WHITE or OFF.
 #
 # Two things follow that the old thresholds got wrong:
 #
@@ -274,7 +282,23 @@ RING_RETRIGGER_MAX   = 2     # brew re-triggers per cycle before giving up; a ma
                              # that keeps returning to ready is not going to be fixed
                              # by more pulses, and hammering the button is a hazard
 
+# -- Ring poll pacing ----------------------------------------------------------
+# The TCS34725 integrates for 50 ms, and the ring wait loops used to poll it
+# back-to-back with no gap at all -- each reading then reflects a window still
+# mixing the PREVIOUS poll's conditions, and (until FW 2026-08-10.1 turned it off
+# for reads) every poll also re-strobed the board's white illumination LED against
+# a mid-integration sensor. Pacing guarantees at least one full, undisturbed
+# integration period between ring reads. The ring's states last seconds (ready
+# glow) or a ~1 s flash (green), so this rate still samples each several times.
+RING_POLL_S = 0.4
 # -- Ring sensor color thresholds ---------------------------------------------
+# Calibrated for reads taken with the illumination LED OFF (FW 2026-08-10.1): the
+# LED sat against a semi-reflective surface, so its white bounce could dominate the
+# reading and drag every ratio toward neutral. With it off the sensor sees only the
+# ring's own emission, and a fully dark ring reads (0,0,0) -> no color, keep polling.
+# NOTE: bleed compensation (_blue_bleed_window) is an ERROR-LIGHT concern only. It
+# must never gate a ring reading -- the ring sensor is trusted as-is, and a test pins
+# that no ring-path function consults the bleed window.
 # FIRST CYCLE ONLY: the ready cue is accepted from ANY ring reading that is not
 # white-ish (channel spread above this), not just a strict blue. The first cycle of a
 # sequence keeps missing the strict blue match (the machine's ring can come out of a
@@ -771,6 +795,7 @@ class CycleRunner:
             if stop_flag.is_set() or self._error_flag.is_set():
                 return False
             status_cb(4, f"Waiting for machine ready (blue)... {int(deadline - time.time())}s")
+            stop_flag.wait(RING_POLL_S)   # let the sensor finish a clean integration
             resp = f.send("GET COLOR RING TAG", expect="RGB:", accept=("ERROR:",))
             rgb = _parse_rgb(resp, "RING")
             if rgb is not None:
@@ -1032,6 +1057,9 @@ class CycleRunner:
             if self._error_flag.is_set(): return "error", self._error_detail
             status_cb(5, f"Waiting for green flash -- {int(timeout_end - time.time())}s remaining")
 
+            # Paced like _wait_for_blue: a poll straight after the previous one reads a
+            # window still mixing the last poll's conditions (see RING_POLL_S).
+            stop_flag.wait(RING_POLL_S)
             resp = f.send("GET COLOR RING TAG", expect="RGB:", accept=("ERROR:",))
             print(f"[serial] GET COLOR RING -> {resp!r}")
             rgb = _parse_rgb(resp, "RING")

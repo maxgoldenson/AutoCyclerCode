@@ -472,6 +472,36 @@ def test_first_cycle_ready_cue_is_relaxed():
     print("PASS: first-cycle ready cue relaxed to non-white; strict from cycle 2 on")
 
 
+def test_bleed_compensation_never_touches_the_ring_path():
+    """The blue-bleed window compensates the ERROR sensor for the ring's glow spilling
+    onto it. The ring sensor itself is fine and is trusted as-is: no ring-path function
+    may consult the bleed window. Also pins the poll pacing -- ring reads must be
+    spaced by RING_POLL_S so the sensor completes a clean integration between them."""
+    import inspect
+    for fn in (cc.CycleRunner._wait_for_blue, cc.CycleRunner._wait_for_ring,
+               cc.CycleRunner._ring_is_ready_cue, cc.CycleRunner._classify_ring_color):
+        assert "_blue_bleed_window" not in inspect.getsource(fn), fn.__name__
+    assert "RING_POLL_S" in inspect.getsource(cc.CycleRunner._wait_for_blue)
+    assert "RING_POLL_S" in inspect.getsource(cc.CycleRunner._wait_for_ring)
+    print("PASS: bleed compensation is error-light-only; ring polls are paced")
+
+
+def test_dark_sensors_read_as_data_not_failure():
+    """With the illumination LED permanently off (FW 2026-08-10.1), an unlit indicator
+    legitimately reads (0,0,0). On the error light that is spread-zero neutral --
+    healthy idle, never a step toward the unreadable-sensor halt; a dark ring is
+    simply 'not ready yet'."""
+    class DarkErrorFront(FrontBoard):
+        def __call__(self, cmd):
+            if cmd.startswith("GET COLOR ERROR"):
+                return [b"RGB:0,0,0\n"]
+            return super().__call__(cmd)
+    ok, msg = _run_cycle_with_front(DarkErrorFront())
+    assert ok, msg
+    assert cc.CycleRunner._classify_error_light(0, 0, 0) is None
+    print("PASS: dark (0,0,0) sensors are data (idle), not failed reads")
+
+
 def test_orange_ring_still_prompts_the_operator():
     """The orange/yellow prompt stays as a second net alongside the error light."""
     outcome, detail = _ring_outcome("3.0", [b"RGB:220,60,10\n"], ring_timeout=5)
@@ -1109,6 +1139,8 @@ if __name__ == "__main__":
         test_cycle_starts_gate_closed_before_dispensing,
         test_blue_ring_never_warns_in_either_mode,
         test_first_cycle_ready_cue_is_relaxed,
+        test_bleed_compensation_never_touches_the_ring_path,
+        test_dark_sensors_read_as_data_not_failure,
         test_blue_ring_does_not_block_green,
         test_orange_ring_still_prompts_the_operator,
         test_error_light_classifies_fault_colors_not_brightness,
