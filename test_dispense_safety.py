@@ -547,13 +547,13 @@ def test_classifies_the_machines_actual_led_colors():
 def test_ring_bleed_never_reads_as_the_water_error():
     """The mistrigger, from the real machine. ReadyStartCup -- the state the fixture
     WAITS in -- lights all 24 ring LEDs PURE_BLUE, and the ring sits next to the error
-    sensor. What the sensor sees is neighbouring WHITE icons plus blue spill, and white
-    raises red and green together, so bleed always lands at g ~= r. The real water error
-    (DODGER_BLUE) has g FAR above r. That relationship is the only thing separating
-    them -- no brightness or blueness threshold can."""
+    sensor. Two bleed regimes, both of which must read as idle: with the illumination
+    LED on (old firmware), white wash put bleed at g ~= r, rejected by the g/r gate;
+    with the LED off (FW 2026-08-10.1), bleed lands at g ~ 6r with b/g ~ 3, rejected
+    by the b/g gate (the real DODGER_BLUE has b/g = 4.4)."""
     classify = cc.CycleRunner._classify_error_light
     bleeds = [
-        (94, 86, 255),   # the reading actually reported from the fixture
+        (94, 86, 255),   # the reading actually reported from the fixture (LED-on era)
         (85, 85, 255),   # white icons + full ring spill
         (40, 38, 255),   # dimmer white (Brew icon mid-blink) + spill
         (0,   0, 255),   # pure ring spill, no white at all
@@ -563,22 +563,29 @@ def test_ring_bleed_never_reads_as_the_water_error():
                          # so only the g/r RATIO rejects it -- each gate earns its keep
                          # at a different point in the white/blue mix range
         (120, 110, 240), # bright white + spill
+        # ⭐ LED-off bleed, measured in the field (FW 2026-08-10.1): with no white LED
+        # wash, the ring's blue leaks into the sensor's GREEN channel (g ~ 6r), so the
+        # g/r discriminator passes it and only the b/g gate (b > 3.5g) rejects it.
+        (10, 61, 181),
+        (12, 66, 190),   # the same bleed, slightly brighter
     ]
     for rgb in bleeds:
         assert classify(*rgb) is None, f"ring bleed {rgb} must not read as a fault"
-    # ...and the genuine water error still does, including with white spill on top.
+    # ...and the genuine water error still does, seen clean or near-clean.
     assert classify(1, 47, 207) == "blue"
-    assert classify(20, 90, 230) == "blue", "strongly blue reading with a green lean"
-    # ⭐ Pins the gate from ABOVE, which the rest of this table does not. Modelling a real
-    # DODGER_BLUE diluted by light from neighbouring white icons -- alpha*(1,47,207) +
-    # (1-alpha)*(85,85,85) -- every other gate still passes down to alpha ~= 0.62, so the
-    # physically reachable band runs g/r from ~1.85 up. Without an assertion in that band
-    # the discriminator could be tightened 3.5x with the suite still green, and a genuine
-    # water error seen through ~20% white contamination would classify as idle.
-    # (30,60,164) is that mix at alpha = 0.65, g/r = 2.0; it fails for any gate >= 2.0.
-    assert classify(30, 60, 164) == "blue", \
-        "a real fill error diluted ~35% by neighbouring white icons must still classify"
-    print("PASS: ring bleed reads as idle, the real water error still halts")
+    assert classify(9, 51, 195) == "blue", \
+        "DODGER_BLUE through ~10% white contamination must still classify"
+    # ⭐ DELIBERATELY SACRIFICED: a real DODGER_BLUE diluted ~20%+ by neighbouring white
+    # icons -- alpha*(1,47,207) + (1-alpha)*(85,85,85), alpha <= ~0.8 -- is chromatically
+    # inside the measured LED-off bleed band ((18,55,183) at alpha=0.8 vs bleed
+    # (10,61,181)), so no threshold can keep both. Field data wins: that band reads
+    # idle. A machine stuck in FillingError never brews, so the ring timeout still
+    # halts the run; blue just has to be seen near-undiluted to be NAMED as the cause.
+    assert classify(18, 55, 183) is None, \
+        "the diluted band is conceded to the bleed side -- if this classifies blue " \
+        "again, the b/g gate has been loosened back into the mistrigger zone"
+    print("PASS: ring bleed (LED-on and LED-off eras) reads as idle, "
+          "a near-clean water error still halts")
 
 
 def test_white_ish_readings_are_not_blue():
@@ -589,8 +596,8 @@ def test_white_ish_readings_are_not_blue():
     for r, g, b in ((80, 78, 125), (90, 85, 140), (95, 90, 150), (88, 84, 158)):
         assert classify(r, g, b) is None, \
             f"({r},{g},{b}) is white-ish and must not read as blue"
-    # ...while genuine blues, including the real bleed reading, still classify.
-    for r, g, b in ((1, 47, 207), (20, 90, 230), (5, 60, 200)):
+    # ...while genuine near-undiluted blues still classify.
+    for r, g, b in ((1, 47, 207), (5, 50, 200), (9, 51, 195)):
         assert classify(r, g, b) == "blue", f"({r},{g},{b}) must still read as blue"
     print("PASS: white-ish tilts are idle, genuine blues still classify as blue")
 

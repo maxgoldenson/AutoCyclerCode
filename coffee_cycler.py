@@ -78,7 +78,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-10 22:52"
+VERSION = "2026-08-10 22:59"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -228,9 +228,22 @@ ERROR_LIGHT_BLUE_MIN_SHARE   = 0.50
 #
 # Requiring g > r * 1.25 keeps the real water error and rejects the bleed, and it holds
 # across every white/blue mix ratio: more white raises r and g together, less white drops
-# both toward zero (pure spill reads (0,0,255), where g > r*1.25 is false). No brightness
-# or blueness threshold can separate these two — only the red/green relationship can.
+# both toward zero (pure spill reads (0,0,255), where g > r*1.25 is false).
 ERROR_LIGHT_BLUE_G_OVER_R    = 1.25
+# ⭐ The LED-off bleed gate. With the illumination LED no longer washing reads white
+# (FW 2026-08-10.1), ordinary ring bleed measured in the field lands at (10,61,181):
+# g is now well ABOVE r (the ring's blue leaks into the sensor's green channel far
+# more than its red), so the g/r discriminator above no longer rejects it. What still
+# separates them is how much blue exceeds GREEN:
+#   real fill error   DODGER_BLUE  (  1, 47,207)   b/g = 4.4
+#   LED-off bleed     field reading( 10, 61,181)   b/g = 2.97
+# Requiring b > g * 3.5 splits that gap. The DELIBERATE cost: a real DODGER_BLUE
+# diluted more than ~15-20% by neighbouring white icons falls to the bleed side and
+# reads idle — chromatically that band is indistinguishable from the measured bleed,
+# and a false water-error halt on every first ready-glow is the worse failure. A
+# machine genuinely stuck in FillingError never brews, so the ring timeout still
+# halts the run; blue just has to be seen near-undiluted to be NAMED as the cause.
+ERROR_LIGHT_BLUE_B_OVER_G    = 3.5
 # ...and an ABSOLUTE floor on the same gap, because the ratio degenerates exactly where
 # the bleed is worst. The Brew icon BLINKS, so white content falls toward zero on every
 # off-phase; at that point r is a couple of counts of sensor noise and "g > r * 1.25"
@@ -866,7 +879,8 @@ class CycleRunner:
         share = b / total
         return (b > r * ERROR_LIGHT_BLUE_B_OVER_R
                 and g > r * ERROR_LIGHT_BLUE_G_OVER_R
-                and (g - r) >= ERROR_LIGHT_BLUE_GR_MARGIN,
+                and (g - r) >= ERROR_LIGHT_BLUE_GR_MARGIN
+                and b > g * ERROR_LIGHT_BLUE_B_OVER_G,
                 b >= ERROR_LIGHT_BLUE_MIN_B,
                 share >= ERROR_LIGHT_BLUE_MIN_SHARE,
                 share)
@@ -995,7 +1009,8 @@ class CycleRunner:
                         # the numbers: this is the line to tune ERROR_LIGHT_BLUE_* from,
                         # and a REAL blue landing here is a water error going unhalted.
                         missed = ", ".join(n for n, ok in (
-                            (f"dominance(b<{ERROR_LIGHT_BLUE_B_OVER_R}xr or g<{ERROR_LIGHT_BLUE_G_OVER_R}xr)", dominant),
+                            (f"dominance(b<{ERROR_LIGHT_BLUE_B_OVER_R}xr or g<{ERROR_LIGHT_BLUE_G_OVER_R}xr "
+                             f"or b<{ERROR_LIGHT_BLUE_B_OVER_G}xg)", dominant),
                             (f"magnitude(<{ERROR_LIGHT_BLUE_MIN_B})", bright),
                             (f"purity(<{ERROR_LIGHT_BLUE_MIN_SHARE})", pure)) if not ok)
                         hint = (f"  [blue-ish: b/r={b / max(1, r):.2f} "
