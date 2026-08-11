@@ -133,6 +133,19 @@ Details + the shelved op-reorder: `docs/machine_mode_3_0.md`.
 assignments plus app-level keys (`machine_mode`); `DeviceManager._save_config` re-reads
 before writing so a port re-discovery never wipes them.
 
+**First flash (factory-blank ESP32) — from the kiosk UI:** identity lives in the firmware
+(`WHO AM I`), so neither discovery nor the launcher can place a blank board. Discovery
+(`DeviceManager.discover`) tracks openable-but-silent ports in `unrecognized_ports`; when a
+failed scan leaves EXACTLY ONE (gate: `_first_flash_candidate`, pinned by test — two silent
+boards are ambiguous, never offer), `_on_discovery_done` pops a pendant-navigable menu
+(Dispenser / Front assembly / Not now). Choice → `_first_flash_worker`: arduino-cli compile +
+upload (same FQBN/env as launcher), verify `WHO AM I`, record FW_VERSION to
+`flashed_firmware.json` (so the launcher won't re-flash), reconnect. During the flash the app
+refreshes the OTA busy marker every second (compile ≫ the 30 s stale window) and pauses
+auto-reconnect (a probe would grab the port being uploaded to; a completing rescan would stack
+a second dialog — `_flashing` / `_flash_offer_open` flags). "Not now" is remembered per port
+until it disappears and returns. Docs: `docs/*_wiring.md` § First flash.
+
 **OTA / fleet (launcher.py):** The Pi polls `main` and auto-updates `coffee_cycler.py`
 (gated on file md5) and the ESP32 firmware. Firmware flashing is gated on each sketch's
 `#define FW_VERSION "..."`, NOT its md5 — so editing comments/whitespace never re-flashes

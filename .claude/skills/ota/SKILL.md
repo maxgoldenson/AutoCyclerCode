@@ -79,6 +79,16 @@ passwordless `sudo` (the Pi default).
   without disturbing the app; a present-but-absent target board is deferred with a
   "waiting for <board>" note. A topology/backoff throttle avoids stopping the app every
   minute while waiting.
+- **Factory-blank boards are the APP's job, not the launcher's.** A blank ESP32 answers
+  no `WHO AM I` and has no old firmware to infer from, so the launcher can't place it.
+  `coffee_cycler.py` handles it: discovery tracks openable-but-silent ports, and when a
+  failed scan leaves EXACTLY ONE, the kiosk offers a menu (Dispenser / Front assembly /
+  Not now), then compiles + uploads that sketch with the same arduino-cli/FQBN settings,
+  verifies `WHO AM I`, and writes the version to `flashed_firmware.json` so the launcher
+  doesn't immediately re-flash. Never offer with two silent boards (can't tell which is
+  which — pinned by `test_first_flash_offer_needs_exactly_one_unknown_board`). During an
+  app-side flash the app refreshes the busy marker every second so the launcher can't
+  stop it mid-upload, and auto-reconnect is paused so discovery can't grab the port.
 
 ## Hard-won gotchas — do NOT regress these
 

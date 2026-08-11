@@ -190,6 +190,14 @@ Then once a minute it re-checks GitHub and logs only when something changes.
   (`flashed_firmware.json` absent), both boards are flashed to the branch's current
   firmware to establish a known-good baseline. After that, only genuine firmware
   changes flash.
+- **Factory-blank boards are flashed from the app, not the launcher.** The launcher can
+  only flash boards it can identify with `WHO AM I`, and a blank board answers nothing
+  (`Probe /dev/ttyUSB…: no WHO AM I reply`). Plug in **one** blank board: the app
+  detects the single silent port and offers a menu (Dispenser / Front assembly), then
+  compiles + flashes + verifies it in place and records the version so the launcher
+  doesn't re-flash. Two unknown boards → no menu, on purpose (no way to tell which is
+  which); do them one at a time. Manual fallback: `docs/dispenser_wiring.md` /
+  `docs/front_assembly_wiring.md` § *First flash*.
 - **Failed/skipped flashes retry.** Flashing is gated on a "last successfully flashed"
   record, so a missing toolchain, missing port, or bad compile is retried next cycle —
   it won't silently leave the boards on stale firmware.

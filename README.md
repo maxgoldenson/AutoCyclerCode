@@ -47,6 +47,15 @@ raises a "busy" flag; the launcher defers *all* updates (app, firmware, and the 
 until the series finishes, then applies them. If the app crashes mid-run the flag goes
 stale and updates resume on their own.
 
+**Brand-new (factory-blank) ESP32s are flashed from the kiosk UI.** A blank board can't
+answer `WHO AM I`, so neither the launcher nor discovery can know what it is. Plug in
+**one** blank board and the app detects the single silent port and pops a menu — pick
+*Dispenser* or *Front assembly* and it compiles, flashes, verifies, and reconnects in
+place. With two unknown boards attached the menu never appears (no way to tell which is
+which) — flash them one at a time. Details + the manual fallback:
+[`docs/dispenser_wiring.md`](docs/dispenser_wiring.md) /
+[`docs/front_assembly_wiring.md`](docs/front_assembly_wiring.md).
+
 ---
 
 ## 3. Releasing an update (maintainer)
