@@ -132,7 +132,15 @@ which is what makes it answer `WHO AM I` → `IAM:FRONT_ASSEMBLY`.
 That's also why the OTA launcher **cannot** do the first flash: it maps board → port by probing
 every USB serial port with `WHO AM I`, and a blank board answers nothing (the log shows
 `Probe /dev/ttyUSB…: no WHO AM I reply`), so the launcher has no way to know which sketch the
-board should get. The first flash is manual:
+board should get. There are two ways to do the first flash:
+
+**From the kiosk UI (easiest):** plug the single blank board into the Pi. When discovery finds
+exactly one ESP32 that opens but stays silent, the app pops a **"New ESP32 detected — first
+flash?"** menu — pick *Dispenser* or *Front assembly* and it compiles, flashes, and verifies the
+board in place, then reconnects. The menu deliberately never appears with two unknown boards
+attached (no way to tell which is which) — flash one at a time.
+
+**Manually (fallback, e.g. no working app):**
 
 1. **Plug in only the one blank board** (unplug the other ESP32) so there's no port ambiguity.
 2. Compile and upload this unit's sketch:

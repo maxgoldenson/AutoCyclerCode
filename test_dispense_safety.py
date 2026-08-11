@@ -472,6 +472,19 @@ def test_first_cycle_ready_cue_is_relaxed():
     print("PASS: first-cycle ready cue relaxed to non-white; strict from cycle 2 on")
 
 
+def test_first_flash_offer_needs_exactly_one_unknown_board():
+    """The first-flash menu may only appear for EXACTLY ONE openable-but-silent port.
+    Identity lives in the firmware, so with two silent boards there is no way to know
+    which physical unit is which -- offering a choice there invites flashing the wrong
+    sketch onto both. Declined ports stay quiet until they disappear and return."""
+    cand = cc.CoffeeCyclerApp._first_flash_candidate
+    assert cand([], set()) is None                          # nothing attached
+    assert cand(["/dev/ttyUSB1"], set()) == "/dev/ttyUSB1"  # the one safe case
+    assert cand(["/dev/ttyUSB1"], {"/dev/ttyUSB1"}) is None # operator said Not now
+    assert cand(["/dev/ttyUSB1", "/dev/ttyUSB2"], set()) is None  # ambiguous -- never
+    print("PASS: first-flash offer gated to exactly one unrecognized board")
+
+
 def test_bleed_compensation_never_touches_the_ring_path():
     """The blue-bleed window compensates the ERROR sensor for the ring's glow spilling
     onto it. The ring sensor itself is fine and is trusted as-is: no ring-path function
@@ -1146,6 +1159,7 @@ if __name__ == "__main__":
         test_cycle_starts_gate_closed_before_dispensing,
         test_blue_ring_never_warns_in_either_mode,
         test_first_cycle_ready_cue_is_relaxed,
+        test_first_flash_offer_needs_exactly_one_unknown_board,
         test_bleed_compensation_never_touches_the_ring_path,
         test_dark_sensors_read_as_data_not_failure,
         test_blue_ring_does_not_block_green,

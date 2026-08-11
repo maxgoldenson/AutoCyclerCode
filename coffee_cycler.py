@@ -62,6 +62,8 @@ import time
 import json
 import os
 import random
+import re
+import subprocess
 import socket
 import tempfile
 import datetime
@@ -78,7 +80,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-10 22:59"
+VERSION = "2026-08-11 18:14"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -134,6 +136,23 @@ def _is_onboard_uart(device: str) -> bool:
 # -- Device IDs ----------------------------------------------------------------
 ID_DISPENSER = "DISPENSER"
 ID_FRONT     = "FRONT_ASSEMBLY"
+
+# -- First flash (factory-blank ESP32) -----------------------------------------
+# A board's identity lives in its FIRMWARE (WHO AM I), so neither the app nor the OTA
+# launcher can know what a blank board is. When discovery finds EXACTLY ONE port that
+# opens but answers nothing, the app offers a menu: the operator names the unit, and
+# the app compiles + flashes that sketch in place. One silent port is the only safe
+# trigger -- with two, there is no way to know which physical board is which.
+# Tooling mirrors launcher.py so the two flashers can never disagree.
+ARDUINO_CLI          = os.environ.get("ARDUINO_CLI", "arduino-cli")
+ESP32_FQBN           = os.environ.get("ESP32_FQBN", "esp32:esp32:esp32")
+FIRSTFLASH_SKETCHES  = {ID_DISPENSER: os.path.join(_DIR, "AUTOCYCLER_DISPENSOR"),
+                        ID_FRONT:     os.path.join(_DIR, "AUTOCYCLER_FRONT")}
+FLASH_STATE_FILE     = os.path.join(_DIR, "flashed_firmware.json")  # launcher's record
+COMPILE_TIMEOUT_S    = 600   # ESP32 compile on a Pi can be slow
+UPLOAD_TIMEOUT_S     = 240
+FLASH_BOOT_WAIT_S    = 3.0   # freshly flashed board's boot time before verification
+_FW_VERSION_RE       = re.compile(r'#define\s+FW_VERSION\s+"([^"]*)"')
 
 # -- Servo angles (0-180 deg) --------------------------------------------------
 SERVO_REST = 48
@@ -630,6 +649,9 @@ class DeviceManager:
         self.dispenser: Optional[SerialDevice] = None
         self.front:     Optional[SerialDevice] = None
         self._saved: dict = self._load_config()
+        # Ports that opened but never answered WHO AM I on the last scan -- the
+        # signature of a factory-blank ESP32 (see the first-flash notes).
+        self.unrecognized_ports: list[str] = []
 
     def _load_config(self) -> dict:
         if os.path.exists(CONFIG_FILE):
@@ -652,17 +674,23 @@ class DeviceManager:
         except Exception:
             pass
 
-    def _probe(self, port: str) -> Optional[str]:
+    def _probe(self, port: str) -> tuple[Optional[str], bool]:
+        """-> (identity, opened). identity is the IAM: id or None; opened says whether
+        the port could be opened at all. (opened=True, identity=None) is the signature
+        of a factory-blank ESP32 -- present on USB, silent on WHO AM I -- which is what
+        the first-flash offer keys on."""
         s = None
+        opened = False
         try:
             s = serial.Serial(port, BAUD_RATE, timeout=1.0, exclusive=_EXCLUSIVE)
+            opened = True
             _wait_for_ready(s)
             s.reset_input_buffer()
             s.write(b"WHO AM I\n")
             s.timeout = DISCOVERY_TIMEOUT
             resp = s.readline().decode("utf-8", errors="replace").strip()
             if resp.startswith("IAM:"):
-                return resp[4:]
+                return resp[4:], True
         except Exception:
             pass
         finally:
@@ -674,14 +702,16 @@ class DeviceManager:
                     s.close()
                 except Exception:
                     pass
-        return None
+        return None, opened
 
     def discover(self, status_cb=None) -> tuple[bool, str]:
         found: dict[str, str] = {}
+        silent: list[str] = []   # ports that opened but never answered WHO AM I
         for dev_id, port in self._saved.items():
             if dev_id not in (ID_DISPENSER, ID_FRONT): continue
             if status_cb: status_cb(f"Trying saved port {port} for {dev_id}...")
-            if self._probe(port) == dev_id:
+            ident, _opened = self._probe(port)
+            if ident == dev_id:
                 found[dev_id] = port
         if len(found) < 2:
             all_ports = [p.device for p in serial.tools.list_ports.comports()
@@ -691,9 +721,14 @@ class DeviceManager:
                 if len(found) == 2: break
                 if port in already: continue
                 if status_cb: status_cb(f"Scanning {port}...")
-                dev_id = self._probe(port)
+                dev_id, opened = self._probe(port)
                 if dev_id in (ID_DISPENSER, ID_FRONT) and dev_id not in found:
                     found[dev_id] = port
+                elif dev_id is None and opened:
+                    silent.append(port)
+        # Openable-but-silent ports, for the first-flash offer. Rebuilt every scan so a
+        # board that starts answering (or gets unplugged) drops off the list.
+        self.unrecognized_ports = silent
         if ID_DISPENSER not in found:
             return False, f"Could not find {ID_DISPENSER} on any COM port."
         if ID_FRONT not in found:
@@ -1496,6 +1531,9 @@ class CoffeeCyclerApp:
         self.runner: Optional[object] = None   # live CycleRunner, used by _tick for adaptive ETA
         self._discovering         = False      # a discovery scan is in progress
         self._last_auto_discovery = 0.0        # last time idle auto-reconnect fired
+        self._flashing            = False      # a first-flash is in progress
+        self._flash_offer_open    = False      # the first-flash dialog is on screen
+        self._flash_declined: set = set()      # ports the operator said "Not now" to
         self._focus_lost_at: Optional[float] = None   # when the app last had no focus
 
         # Pendant state
@@ -2182,10 +2220,180 @@ class CoffeeCyclerApp:
             self._set_conn(f"Connection failed: {msg}", self.DANGER)
             self._set_status("Waiting for devices -- plug in the USB module(s); "
                              "retrying automatically.", self.WARNING)
+            # A "Not now" only holds while that port stays silent and present; unplug
+            # (or a board that starts answering) clears it so a re-plug re-offers.
+            self._flash_declined &= set(self.devices.unrecognized_ports)
+            port = self._first_flash_candidate(self.devices.unrecognized_ports,
+                                               self._flash_declined)
+            if port and not self._flashing and not self._flash_offer_open:
+                self._show_first_flash_dialog(port)
 
     def _set_conn(self, text: str, color: str):
         self.conn_var.set(text)
         self.conn_label.configure(foreground=color)
+
+    # =========================================================================
+    #  First flash — name and program a factory-blank ESP32 from the UI
+    # =========================================================================
+    @staticmethod
+    def _first_flash_candidate(unrecognized: list, declined: set) -> Optional[str]:
+        """The one port to offer a first flash for, or None.
+
+        EXACTLY ONE openable-but-silent port is the only safe trigger: identity lives
+        in the firmware, so with two silent boards there is no way to know which
+        physical unit is which -- offering a menu there invites flashing the wrong
+        sketch onto both. Zero silent ports means nothing to do."""
+        if len(unrecognized) != 1:
+            return None
+        port = unrecognized[0]
+        return None if port in declined else port
+
+    def _show_first_flash_dialog(self, port: str):
+        self._flash_offer_open = True
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New board detected")
+        dlg.configure(bg=self.PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("520x330")
+
+        tk.Label(dlg, text="New ESP32 detected -- first flash?",
+                 bg=self.PANEL, fg=self.TEXT,
+                 font=("Helvetica", 14, "bold")).pack(anchor="w", padx=24, pady=(22, 6))
+        tk.Label(dlg,
+                 text=(f"The board on {port} doesn't answer WHO AM I -- it looks "
+                       f"factory-blank. A board's identity comes from its firmware, "
+                       f"so tell me which unit this is and I'll flash it in place."),
+                 bg=self.PANEL, fg=self.MUTED, font=("Helvetica", 10),
+                 wraplength=460, justify="left").pack(anchor="w", padx=24, pady=(0, 16))
+
+        def _choose(board):
+            self._flash_offer_open = False
+            self._pend_pop_context()
+            dlg.destroy()
+            if board is None:
+                self._flash_declined.add(port)
+                return
+            self._start_first_flash(port, board)
+
+        bf = tk.Frame(dlg, bg=self.PANEL)
+        bf.pack(fill="x", padx=24)
+        disp_btn  = ttk.Button(bf, text="This is the DISPENSER",
+                               style="Accent.TButton",
+                               command=lambda: _choose(ID_DISPENSER))
+        front_btn = ttk.Button(bf, text="This is the FRONT ASSEMBLY (door)",
+                               style="Accent.TButton",
+                               command=lambda: _choose(ID_FRONT))
+        skip_btn  = ttk.Button(bf, text="Not now",
+                               style="Small.TButton",
+                               command=lambda: _choose(None))
+        disp_btn.pack(fill="x", pady=(0, 6))
+        front_btn.pack(fill="x", pady=(0, 6))
+        skip_btn.pack(fill="x")
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _choose(None))
+        self._pend_push_context([
+            ("button", disp_btn,  None, None, None, "Dispenser"),
+            ("button", front_btn, None, None, None, "Front assembly"),
+            ("button", skip_btn,  None, None, None, "Not now"),
+        ], start_idx=0)
+
+    def _start_first_flash(self, port: str, board: str):
+        if self._flashing:
+            return
+        self._flashing = True
+        self.start_btn.configure(state="disabled")
+        self.reconnect_btn.configure(state="disabled")
+        self._set_conn(f"Flashing {board} firmware to {port} -- do not unplug...",
+                       self.WARNING)
+        threading.Thread(target=self._first_flash_worker, args=(port, board),
+                         daemon=True).start()
+
+    def _flash_cli(self, args: list, timeout: float) -> tuple[int, str]:
+        """Run one arduino-cli command, refreshing the launcher's busy marker while it
+        runs so the OTA loop never stops the app / grabs the port mid-flash. (A compile
+        can take minutes; the marker goes stale in 30 s, so write-once is not enough.)"""
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
+        deadline = time.time() + timeout
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                return 1, f"timed out after {int(timeout)}s"
+            self._write_busy()
+            time.sleep(1.0)
+        out = (proc.stdout.read() if proc.stdout else "") or ""
+        return proc.returncode, out.strip()
+
+    def _first_flash_worker(self, port: str, board: str):
+        sketch = FIRSTFLASH_SKETCHES[board]
+        def status(text, color):
+            self.root.after(0, lambda: self._set_conn(text, color))
+        try:
+            status(f"Compiling {board} firmware... (can take a few minutes)", self.WARNING)
+            rc, out = self._flash_cli([ARDUINO_CLI, "compile", "--fqbn", ESP32_FQBN,
+                                       sketch], COMPILE_TIMEOUT_S)
+            if rc != 0:
+                print(f"[flash] compile failed for {board}:\n{out[:1500]}")
+                status(f"Compile failed for {board} -- see log; flash manually "
+                       f"(docs/*_wiring.md)", self.DANGER)
+                return
+            status(f"Uploading {board} firmware to {port}...", self.WARNING)
+            rc, out = self._flash_cli([ARDUINO_CLI, "upload", "-p", port,
+                                       "--fqbn", ESP32_FQBN, sketch], UPLOAD_TIMEOUT_S)
+            if rc != 0:
+                print(f"[flash] upload failed for {board} on {port}:\n{out[:1500]}")
+                status(f"Upload to {port} failed -- check the cable and retry", self.DANGER)
+                return
+            # Verify identity took before declaring success -- flashing is only half
+            # the job; WHO AM I answering is what discovery (and the launcher) key on.
+            time.sleep(FLASH_BOOT_WAIT_S)
+            ident, _opened = self.devices._probe(port)
+            if ident != board:
+                print(f"[flash] verification failed: {port} answered {ident!r}, "
+                      f"expected {board}")
+                status(f"Flashed, but {port} answers {ident or 'nothing'} -- "
+                       f"power-cycle the board and Reconnect", self.WARNING)
+                return
+            self._record_flashed_version(board)
+            print(f"[flash] {board} first-flashed on {port} and verified")
+            status(f"{board} flashed and verified on {port} -- reconnecting...",
+                   self.SUCCESS)
+            self.root.after(0, self._start_discovery)
+        except FileNotFoundError:
+            status("arduino-cli not found -- flash manually (docs/*_wiring.md)",
+                   self.DANGER)
+        except Exception as e:
+            print(f"[flash] first-flash error: {e}")
+            status(f"Flash error: {e}", self.DANGER)
+        finally:
+            self._flashing = False
+            self._clear_busy()
+            self.root.after(0, lambda: self.reconnect_btn.configure(state="normal"))
+
+    @staticmethod
+    def _record_flashed_version(board: str):
+        """Mirror the launcher's flashed_firmware.json record so it doesn't immediately
+        re-flash a board this app just programmed (its gate is FW_VERSION vs record)."""
+        try:
+            ino = os.path.join(FIRSTFLASH_SKETCHES[board],
+                               os.path.basename(FIRSTFLASH_SKETCHES[board]) + ".ino")
+            with open(ino, encoding="utf-8") as f:
+                m = _FW_VERSION_RE.search(f.read())
+            if not m:
+                return
+            state = {}
+            if os.path.exists(FLASH_STATE_FILE):
+                try:
+                    with open(FLASH_STATE_FILE) as f:
+                        state = json.load(f)
+                except Exception:
+                    state = {}
+            state[board] = m.group(1)
+            with open(FLASH_STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"[flash] could not record flashed version: {e}")
 
     # =========================================================================
     #  Cycle start / stop
@@ -2736,8 +2944,12 @@ class CoffeeCyclerApp:
             self._last_busy_touch = time.time()
             self._write_busy()
 
+        # Auto-reconnect pauses during a first-flash (probing would grab the very port
+        # being uploaded to) and while its offer dialog is open (a rescan completing
+        # would stack a second copy of the dialog).
         if (not self.devices.ready and not self._discovering and not self._starting
                 and not cycle_running
+                and not self._flashing and not self._flash_offer_open
                 and time.time() - self._last_auto_discovery > AUTO_RECONNECT_S):
             self._last_auto_discovery = time.time()
             self._start_discovery()
