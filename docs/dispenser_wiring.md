@@ -62,6 +62,42 @@ Line styles: `-->` 3.3 V logic signal · `==>` 12 V power · `-.-` the shared-gr
 | **5 V power** | Powers the ESP32 board entirely — no other supply on the logic side |
 | **Serial 115200** | `WHO AM I` · `SET ANGLE <deg> [seq]` · `GET STATUS` · `SET MOTOR ON/OFF` · `GET VERSION` — auto-discovered by the app, no fixed port needed |
 
+## First flash (blank ESP32)
+
+A board's identity lives in its **firmware**, not its hardware: a factory-blank ESP32 becomes
+"DISPENSER" by receiving
+[`AUTOCYCLER_DISPENSOR.ino`](../AUTOCYCLER_DISPENSOR/AUTOCYCLER_DISPENSOR.ino), which is what
+makes it answer `WHO AM I` → `IAM:DISPENSER`.
+
+That's also why the OTA launcher **cannot** do the first flash: it maps board → port by probing
+every USB serial port with `WHO AM I`, and a blank board answers nothing (the log shows
+`Probe /dev/ttyUSB…: no WHO AM I reply`), so the launcher has no way to know which sketch the
+board should get. The first flash is manual:
+
+1. **Plug in only the one blank board** (unplug the other ESP32) so there's no port ambiguity.
+2. Compile and upload this unit's sketch:
+
+   ```bash
+   arduino-cli compile --fqbn esp32:esp32:esp32 AUTOCYCLER_DISPENSOR
+   arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 AUTOCYCLER_DISPENSOR
+   ```
+
+3. Verify the identity took (opening the port resets the board — give it ~1.5 s to boot):
+
+   ```bash
+   python3 -c "import serial,time; s=serial.Serial('/dev/ttyUSB0',115200,timeout=2); \
+   time.sleep(1.6); s.reset_input_buffer(); s.write(b'WHO AM I\n'); print(s.readline())"
+   # expect: b'IAM:DISPENSER\r\n'
+   ```
+
+4. Label the board physically. From here on everything is automatic: the app's discovery finds
+   it on whatever port it lands on each boot, and the launcher OTA-reflashes it whenever
+   `FW_VERSION` changes.
+
+Flashed the wrong sketch? Nothing is damaged — the pin maps overlap but no output fights a
+supply — the fixture just won't run. Re-flash the right sketch the same way; identity follows
+the firmware.
+
 ## Bench notes
 
 - **Driver DIP switches must be set to 4× microstepping.** The firmware's `MICROSTEPPING 4` is a

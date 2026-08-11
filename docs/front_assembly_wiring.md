@@ -31,7 +31,7 @@ flowchart LR
 
     subgraph OPENER["DOOR OPENER (fixed unit)"]
         ESP["ESP32 devkit<br/>IAM:FRONT_ASSEMBLY"]
-        BUCK["Buck converter<br/>12 V → servo rail"]
+        BUCK["Buck converter<br/>12 V → 5 V servo rail<br/>⚠ set to 5.0 V BEFORE connecting"]
         SRV["Gate servo<br/>REST 48° · OPEN 68°"]
         JSTA["JST socket"]
     end
@@ -47,7 +47,7 @@ flowchart LR
 
     PI   ---|"USB — 5 V power + serial 115200"| ESP
     PSU  ==>|"+12 V"| BUCK
-    BUCK ==>|"servo rail"| SRV
+    BUCK ==>|"5 V servo rail"| SRV
     ESP  -->|"GPIO 32 — PWM 50 Hz, 500–2400 µs"| SRV
     ESP  ---|"3V3 · GND · SDA 21 · SCL 22 · CAP 33 · LED 25"| JSTA
     JSTA ---|"mating pair"| JSTB
@@ -93,7 +93,7 @@ why the firmware verifies the mux register after switching.
 | Connection | Detail |
 |---|---|
 | Signal | **GPIO 32** — 50 Hz PWM, 500–2400 µs pulse range |
-| Power | **Buck converter output** (from the external 12 V input) — *not* the ESP32's USB 5 V |
+| Power | **Buck converter output, tuned to 5.0 V** (from the external 12 V input) — *not* the ESP32's USB 5 V |
 | Ground | Buck/servo ground bonded to ESP32 logic ground (the single shared-ground point) |
 | Positions | `SERVO_REST` **48°** = gate closed · `SERVO_OPEN` **68°** = gate open |
 | Boot state | Drives to 48° (closed) immediately in `setup()` |
@@ -104,7 +104,7 @@ why the firmware verifies the mux register after switching.
 | From | To | Notes |
 |---|---|---|
 | **+12 V** port | Buck VIN | Feeds the buck only — never the ESP32 or Pi |
-| Buck VOUT | Servo + | Set the buck to the servo's rated voltage before connecting |
+| Buck VOUT | Servo + | **The servo rail is 5 V.** Adjust the buck to 5.0 V — unloaded, with a meter on VOUT — *before* the servo is ever connected. Most bucks ship dialed high; an untuned one can feed the servo 12 V and cook it on the first move |
 | **GND** | Buck GND / servo − / ESP32 GND | Single shared ground across 12 V and logic domains |
 
 ### Raspberry Pi → ESP32 (USB)
@@ -123,6 +123,41 @@ why the firmware verifies the mux register after switching.
 - The host asserts CAP from exactly two places (`_trigger_brew`, `_do_cap_reset`), both reachable
   only from a requested run — pinned by a test so the cycler can never brew unasked.
 
+## First flash (blank ESP32)
+
+A board's identity lives in its **firmware**, not its hardware: a factory-blank ESP32 becomes
+"FRONT_ASSEMBLY" by receiving [`AUTOCYCLER_FRONT.ino`](../AUTOCYCLER_FRONT/AUTOCYCLER_FRONT.ino),
+which is what makes it answer `WHO AM I` → `IAM:FRONT_ASSEMBLY`.
+
+That's also why the OTA launcher **cannot** do the first flash: it maps board → port by probing
+every USB serial port with `WHO AM I`, and a blank board answers nothing (the log shows
+`Probe /dev/ttyUSB…: no WHO AM I reply`), so the launcher has no way to know which sketch the
+board should get. The first flash is manual:
+
+1. **Plug in only the one blank board** (unplug the other ESP32) so there's no port ambiguity.
+2. Compile and upload this unit's sketch:
+
+   ```bash
+   arduino-cli compile --fqbn esp32:esp32:esp32 AUTOCYCLER_FRONT
+   arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 AUTOCYCLER_FRONT
+   ```
+
+3. Verify the identity took (opening the port resets the board — give it ~1.5 s to boot):
+
+   ```bash
+   python3 -c "import serial,time; s=serial.Serial('/dev/ttyUSB0',115200,timeout=2); \
+   time.sleep(1.6); s.reset_input_buffer(); s.write(b'WHO AM I\n'); print(s.readline())"
+   # expect: b'IAM:FRONT_ASSEMBLY\r\n'
+   ```
+
+4. Label the board physically. From here on everything is automatic: the app's discovery finds
+   it on whatever port it lands on each boot, and the launcher OTA-reflashes it whenever
+   `FW_VERSION` changes.
+
+Flashed the wrong sketch? Nothing is damaged — the pin maps overlap but no output fights a
+supply — the fixture just won't run. Re-flash the right sketch the same way; identity follows
+the firmware.
+
 ## Bench notes
 
 - **Unplug / replug behavior:** cover absent at boot → `EVENT:DOOR_COVER_ABSENT`, board stays
@@ -137,7 +172,9 @@ why the firmware verifies the mux register after switching.
 - **A pulled cover can jam the I2C bus** (a device left holding SDA low mid-transfer). The
   firmware clocks the bus free (`i2cRecover`) on the failure path automatically — if color reads
   fail after a rough unplug, just re-issue; no power cycle needed.
-- **Servo power must come from the buck.** Driving the servo from the ESP32's USB 5 V rail
-  brownouts the board mid-swing — the split exists on purpose; keep it.
+- **Servo power must come from the buck, and the buck must be at 5.0 V.** Driving the servo
+  from the ESP32's USB 5 V rail brownouts the board mid-swing — the split exists on purpose;
+  keep it. And the buck's output is adjustable: verify 5.0 V on a meter before the servo is
+  connected (see the power table above).
 - The cap-touch line runs through the JST, so **removing the cover also removes the ability to
   press the brew button** — a fully unplugged cover is a safe state on both sensing and actuation.
