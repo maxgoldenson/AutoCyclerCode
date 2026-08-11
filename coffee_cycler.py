@@ -80,7 +80,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-11 18:14"
+VERSION = "2026-08-11 19:17"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -707,19 +707,28 @@ class DeviceManager:
     def discover(self, status_cb=None) -> tuple[bool, str]:
         found: dict[str, str] = {}
         silent: list[str] = []   # ports that opened but never answered WHO AM I
+        probed: set = set()      # every port costs ~8 s when silent -- never pay twice
         for dev_id, port in self._saved.items():
             if dev_id not in (ID_DISPENSER, ID_FRONT): continue
             if status_cb: status_cb(f"Trying saved port {port} for {dev_id}...")
-            ident, _opened = self._probe(port)
-            if ident == dev_id:
-                found[dev_id] = port
+            ident, opened = self._probe(port)
+            probed.add(port)
+            if ident in (ID_DISPENSER, ID_FRONT) and ident not in found:
+                # Accept whoever actually ANSWERED, not just the board the config
+                # expected -- a swapped/stale saved mapping still identifies first try.
+                found[ident] = port
+            elif ident is None and opened:
+                # Openable but silent on the very port a board used to live on -- a
+                # blank replacement board. Counting it here (not only in the full scan)
+                # is what keeps the first-flash offer fast on a re-used USB slot.
+                silent.append(port)
         if len(found) < 2:
             all_ports = [p.device for p in serial.tools.list_ports.comports()
                          if not _is_onboard_uart(p.device)]
             already   = set(found.values())
             for port in all_ports:
                 if len(found) == 2: break
-                if port in already: continue
+                if port in already or port in probed: continue
                 if status_cb: status_cb(f"Scanning {port}...")
                 dev_id, opened = self._probe(port)
                 if dev_id in (ID_DISPENSER, ID_FRONT) and dev_id not in found:
@@ -1534,6 +1543,7 @@ class CoffeeCyclerApp:
         self._flashing            = False      # a first-flash is in progress
         self._flash_offer_open    = False      # the first-flash dialog is on screen
         self._flash_declined: set = set()      # ports the operator said "Not now" to
+        self._known_ports: Optional[set] = None  # USB topology snapshot (None = pre-first-tick)
         self._focus_lost_at: Optional[float] = None   # when the app last had no focus
 
         # Pendant state
@@ -2250,6 +2260,7 @@ class CoffeeCyclerApp:
 
     def _show_first_flash_dialog(self, port: str):
         self._flash_offer_open = True
+        self._write_busy()   # defer the launcher NOW; _tick keeps it fresh from here
         dlg = tk.Toplevel(self.root)
         dlg.title("New board detected")
         dlg.configure(bg=self.PANEL)
@@ -2298,10 +2309,33 @@ class CoffeeCyclerApp:
             ("button", skip_btn,  None, None, None, "Not now"),
         ], start_idx=0)
 
+    def _probe_new_ports(self, ports: list):
+        """Probe USB ports that just appeared while BOTH boards are connected -- no
+        rescan runs in that state, so without this a blank board plugged into a healthy
+        rig never got the first-flash offer. Probing touches only the new ports, never
+        the connected boards'."""
+        time.sleep(2.0)   # USB enumeration settle before the first open
+        silent = []
+        for port in ports:
+            ident, opened = self.devices._probe(port)
+            if ident is None and not opened:
+                time.sleep(3.0)                       # slow enumeration -- one retry
+                ident, opened = self.devices._probe(port)
+            if ident is None and opened:
+                silent.append(port)
+        def _offer():
+            cycle_running = self.cycle_thread is not None and self.cycle_thread.is_alive()
+            port = self._first_flash_candidate(silent, self._flash_declined)
+            if (port and not self._flashing and not self._flash_offer_open
+                    and not cycle_running):
+                self._show_first_flash_dialog(port)
+        self.root.after(0, _offer)
+
     def _start_first_flash(self, port: str, board: str):
         if self._flashing:
             return
         self._flashing = True
+        self._write_busy()   # cover the gap before the worker's own busy heartbeat
         self.start_btn.configure(state="disabled")
         self.reconnect_btn.configure(state="disabled")
         self._set_conn(f"Flashing {board} firmware to {port} -- do not unplug...",
@@ -2940,9 +2974,42 @@ class CoffeeCyclerApp:
         # Keep the "cycles running" marker fresh so the OTA launcher won't update/flash/
         # reboot mid-series. We refresh it (rather than write once) so that if the app
         # crashes the marker goes stale and the launcher resumes on its own.
-        if cycle_running and time.time() - self._last_busy_touch > BUSY_HEARTBEAT_S:
+        # The busy marker also covers the FIRST-FLASH dialog and flash. The launcher's
+        # own attempt cycle for a pending board compiles, then STOPS THE APP to probe
+        # ports -- which was tearing down the selection menu / flash status "randomly"
+        # (whenever its 60 s check + slow compile happened to land). Busy makes the
+        # launcher defer entirely while the operator is choosing or a flash is running.
+        busy_now = cycle_running or self._flashing or self._flash_offer_open
+        if busy_now and time.time() - self._last_busy_touch > BUSY_HEARTBEAT_S:
             self._last_busy_touch = time.time()
             self._write_busy()
+
+        # New-USB-port watcher: notice a freshly plugged board within a tick instead of
+        # whenever the next full rescan happens to run. comports() is a cheap sysfs
+        # listing -- no ports are opened here. Two paths:
+        #   not ready -> pull the next auto-reconnect forward to ~2 s (USB settle),
+        #                instead of waiting out the AUTO_RECONNECT_S cadence;
+        #   ready     -> no rescan will ever run, so probe JUST the new port(s) in the
+        #                background and offer the first-flash menu for a single silent
+        #                newcomer (this case previously never showed the menu at all).
+        try:
+            current_ports = {p.device for p in serial.tools.list_ports.comports()
+                             if not _is_onboard_uart(p.device)}
+        except Exception:
+            current_ports = self._known_ports or set()
+        if self._known_ports is None:
+            self._known_ports = current_ports   # startup snapshot; discovery already runs
+        else:
+            new_ports = current_ports - self._known_ports
+            self._known_ports = current_ports
+            if (new_ports and not cycle_running and not self._starting
+                    and not self._flashing and not self._flash_offer_open):
+                print(f"[usb] new serial port(s): {sorted(new_ports)}")
+                if not self.devices.ready:
+                    self._last_auto_discovery = time.time() - AUTO_RECONNECT_S + 2.0
+                else:
+                    threading.Thread(target=self._probe_new_ports,
+                                     args=(sorted(new_ports),), daemon=True).start()
 
         # Auto-reconnect pauses during a first-flash (probing would grab the very port
         # being uploaded to) and while its offer dialog is open (a rescan completing

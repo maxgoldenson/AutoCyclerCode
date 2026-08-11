@@ -485,6 +485,40 @@ def test_first_flash_offer_needs_exactly_one_unknown_board():
     print("PASS: first-flash offer gated to exactly one unrecognized board")
 
 
+def test_discover_probes_each_port_once_and_flags_silent_saved_port():
+    """Latency + coverage of the first-flash detection. A silent probe costs ~8 s, and
+    a blank board on a REUSED (saved) port used to be probed twice per scan and only
+    counted by the second pass. Each port must be probed exactly once, a silent saved
+    port must land in unrecognized_ports, and a board answering on the OTHER board's
+    saved port must still be identified (swapped/stale config)."""
+    dm = cc.DeviceManager.__new__(cc.DeviceManager)
+    dm.dispenser = dm.front = None
+    dm._saved = {"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"}
+    dm.unrecognized_ports = []
+    calls = []
+    def fake_probe(port):
+        calls.append(port)
+        # The dispenser answers on FRONT's saved port (swapped config); FRONT's real
+        # slot holds a blank board: opens fine, says nothing.
+        return ("DISPENSER", True) if port == "/dev/ttyUSB1" else (None, True)
+    dm._probe = fake_probe
+
+    class _P:
+        def __init__(self, d): self.device = d
+    orig = cc.serial.tools.list_ports.comports
+    cc.serial.tools.list_ports.comports = lambda: [_P("/dev/ttyUSB0"), _P("/dev/ttyUSB1")]
+    try:
+        ok, _msg = dm.discover()
+    finally:
+        cc.serial.tools.list_ports.comports = orig
+
+    assert not ok                                    # FRONT genuinely absent
+    assert dm.unrecognized_ports == ["/dev/ttyUSB0"], dm.unrecognized_ports
+    assert sorted(calls) == ["/dev/ttyUSB0", "/dev/ttyUSB1"], \
+        f"each port must be probed exactly once (silent probes cost ~8 s): {calls}"
+    print("PASS: discover probes once per port, flags a silent saved port for the menu")
+
+
 def test_bleed_compensation_never_touches_the_ring_path():
     """The blue-bleed window compensates the ERROR sensor for the ring's glow spilling
     onto it. The ring sensor itself is fine and is trusted as-is: no ring-path function
@@ -1160,6 +1194,7 @@ if __name__ == "__main__":
         test_blue_ring_never_warns_in_either_mode,
         test_first_cycle_ready_cue_is_relaxed,
         test_first_flash_offer_needs_exactly_one_unknown_board,
+        test_discover_probes_each_port_once_and_flags_silent_saved_port,
         test_bleed_compensation_never_touches_the_ring_path,
         test_dark_sensors_read_as_data_not_failure,
         test_blue_ring_does_not_block_green,
