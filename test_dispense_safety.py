@@ -485,6 +485,40 @@ def test_first_flash_offer_needs_exactly_one_unknown_board():
     print("PASS: first-flash offer gated to exactly one unrecognized board")
 
 
+def test_first_flash_remembers_the_port_and_reboots_after_recording():
+    """A successful first flash proves where the board lives: the port must be saved
+    as the board's home (discovery tries saved ports first; the launcher's halted-board
+    inference trusts ONLY the saved port), dropped from the 'Not now' list, and the
+    post-flash reboot must come AFTER everything durable is recorded (loop safety,
+    same order as the launcher)."""
+    import os as _os, tempfile as _tempfile, json as _json, inspect
+
+    dm = cc.DeviceManager.__new__(cc.DeviceManager)
+    dm.dispenser = dm.front = None
+    dm._saved = {"FRONT_ASSEMBLY": "/dev/ttyOLD"}
+    dm.unrecognized_ports = []
+    orig_cfg = cc.CONFIG_FILE
+    cc.CONFIG_FILE = _os.path.join(_tempfile.mkdtemp(prefix="ac_cfg_"), "cfg.json")
+    try:
+        with open(cc.CONFIG_FILE, "w") as f:
+            _json.dump({"FRONT_ASSEMBLY": "/dev/ttyOLD", "machine_mode": "3.0"}, f)
+        dm.remember_port("FRONT_ASSEMBLY", "/dev/ttyUSB7")
+        assert dm._saved["FRONT_ASSEMBLY"] == "/dev/ttyUSB7"
+        with open(cc.CONFIG_FILE) as f:
+            cfg = _json.load(f)
+        assert cfg["FRONT_ASSEMBLY"] == "/dev/ttyUSB7", cfg
+        assert cfg["machine_mode"] == "3.0", "app-level config keys must survive"
+    finally:
+        cc.CONFIG_FILE = orig_cfg
+
+    src = inspect.getsource(cc.CoffeeCyclerApp._first_flash_worker)
+    for step in ("_record_flashed_version", "remember_port", "_flash_declined.discard"):
+        assert step in src, f"worker must {step}"
+        assert src.index(step) < src.index("_reboot_pi()"), \
+            f"{step} must happen BEFORE the reboot (loop safety / durable record)"
+    print("PASS: first flash saves the proven port, clears the decline, reboots last")
+
+
 def test_discover_probes_each_port_once_and_flags_silent_saved_port():
     """Latency + coverage of the first-flash detection. A silent probe costs ~8 s, and
     a blank board on a REUSED (saved) port used to be probed twice per scan and only
@@ -1194,6 +1228,7 @@ if __name__ == "__main__":
         test_blue_ring_never_warns_in_either_mode,
         test_first_cycle_ready_cue_is_relaxed,
         test_first_flash_offer_needs_exactly_one_unknown_board,
+        test_first_flash_remembers_the_port_and_reboots_after_recording,
         test_discover_probes_each_port_once_and_flags_silent_saved_port,
         test_bleed_compensation_never_touches_the_ring_path,
         test_dark_sensors_read_as_data_not_failure,

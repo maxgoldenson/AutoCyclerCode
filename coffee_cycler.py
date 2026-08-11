@@ -80,7 +80,7 @@ import serial
 import serial.tools.list_ports
 
 # -- Version -------------------------------------------------------------------
-VERSION = "2026-08-11 19:17"
+VERSION = "2026-08-11 19:27"
 
 # -- File paths ----------------------------------------------------------------
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -673,6 +673,21 @@ class DeviceManager:
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
+
+    def remember_port(self, board: str, port: str):
+        """Record board -> port as the known-good mapping, preserving app-level config
+        keys. Called after a successful first flash: the upload proves where the board
+        physically lives, and both consumers of the saved mapping need to learn it NOW
+        -- discovery tries saved ports first, and the launcher's halted-board inference
+        trusts ONLY a board's saved port. Overwrites any stale mapping for the board."""
+        self._saved[board] = port
+        cfg = self._load_config()
+        cfg[board] = port
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as e:
+            print(f"[flash] could not save port mapping: {e}")
 
     def _probe(self, port: str) -> tuple[Optional[str], bool]:
         """-> (identity, opened). identity is the IAM: id or None; opened says whether
@@ -2379,8 +2394,23 @@ class CoffeeCyclerApp:
                 print(f"[flash] upload failed for {board} on {port}:\n{out[:1500]}")
                 status(f"Upload to {port} failed -- check the cable and retry", self.DANGER)
                 return
-            # Verify identity took before declaring success -- flashing is only half
-            # the job; WHO AM I answering is what discovery (and the launcher) key on.
+            # Upload succeeded: everything durable is recorded BEFORE the reboot, in
+            # the launcher's order (loop safety). The upload itself proves where the
+            # board physically lives, so the port is promoted to the board's saved
+            # home and dropped from the "Not now" list -- it is a good port now.
+            self._record_flashed_version(board)
+            self.devices.remember_port(board, port)
+            self._flash_declined.discard(port)
+            print(f"[flash] {board} first-flashed on {port}; port saved as its home")
+            # Reboot to bring the board online, same as the launcher's flashes: the
+            # ESP32 auto-reset after arduino-cli upload is not dependable (boards can
+            # sit in the bootloader), and a reboot is the known-good recovery.
+            status(f"{board} flashed -- rebooting to bring the board online...",
+                   self.SUCCESS)
+            self._clear_busy()   # don't leave a fresh marker to outlive the reboot
+            if self._reboot_pi():
+                return           # going down -- the reboot tears the rest down
+            # No reboot available (bench machine / no sudo): verify in place instead.
             time.sleep(FLASH_BOOT_WAIT_S)
             ident, _opened = self.devices._probe(port)
             if ident != board:
@@ -2389,8 +2419,7 @@ class CoffeeCyclerApp:
                 status(f"Flashed, but {port} answers {ident or 'nothing'} -- "
                        f"power-cycle the board and Reconnect", self.WARNING)
                 return
-            self._record_flashed_version(board)
-            print(f"[flash] {board} first-flashed on {port} and verified")
+            print(f"[flash] {board} verified on {port} (no reboot available)")
             status(f"{board} flashed and verified on {port} -- reconnecting...",
                    self.SUCCESS)
             self.root.after(0, self._start_discovery)
@@ -2404,6 +2433,26 @@ class CoffeeCyclerApp:
             self._flashing = False
             self._clear_busy()
             self.root.after(0, lambda: self.reconnect_btn.configure(state="normal"))
+
+    @staticmethod
+    def _reboot_pi() -> bool:
+        """Reboot the Pi after a first flash -- the same recovery the launcher uses
+        after its own flashes (the ESP32 auto-reset after upload isn't dependable on
+        this hardware). Loop-safe: the flashed version and the board's port are
+        recorded before this is called. Returns False when the reboot can't be issued
+        (bench/dev machine, no passwordless sudo) so the caller can verify in place."""
+        if not _POSIX:
+            return False
+        try:
+            os.sync()   # flashed_firmware.json + config must be on disk before we go
+            r = subprocess.run(["sudo", "reboot"], timeout=20)
+            if r.returncode != 0:
+                return False   # sudo refused (not the Pi's passwordless setup)
+            time.sleep(45)   # block here until the shutdown takes us down
+            return True
+        except Exception as e:
+            print(f"[flash] reboot could not be issued: {e}")
+            return False
 
     @staticmethod
     def _record_flashed_version(board: str):
