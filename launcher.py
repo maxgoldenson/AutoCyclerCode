@@ -523,6 +523,36 @@ def _probe_ports() -> dict:
     return mapping
 
 
+def _saved_ports() -> dict:
+    """Board id -> last discovered port, from the app's autocycler_config.json.
+    Empty dict if the file is absent/unreadable (e.g. a brand-new install)."""
+    try:
+        with open(os.path.join(APP_DIR, "autocycler_config.json")) as f:
+            cfg = json.load(f)
+        return {b: p for b, p in cfg.items() if b in FIRMWARE}
+    except Exception:
+        return {}
+
+
+def _infer_unidentified(unidentified: list, free_usb: list, saved: dict):
+    """Pair ONE silent changed board with ONE free USB port — but ONLY when that port
+    is the board's SAVED port from the app's discovery record. -> (board, port) or None.
+
+    The fallback exists for a board whose firmware is halted: it can't answer WHO AM I
+    but is still flashable, and it is still sitting on the port it was last discovered
+    on, so the saved-port match holds. A FACTORY-BLANK board must never be claimed
+    here: it has no saved port (or shows up on a new one), and naming blank hardware is
+    the app's first-flash menu's job — a human picks the sketch. Inferring by pure
+    elimination used to flash blank boards as the pending board the moment they were
+    plugged in, with no menu."""
+    if len(unidentified) != 1 or len(free_usb) != 1:
+        return None
+    board, port = unidentified[0], free_usb[0]
+    if saved.get(board) != port:
+        return None
+    return board, port
+
+
 def _list_serial_ports() -> list:
     """Enumerate candidate serial ports WITHOUT opening them — a cheap presence check
     for 'is any USB module plugged in?'."""
@@ -660,19 +690,23 @@ def flash_boards(changes: dict, app=None):
         push()
         mapping = _probe_ports()
         # A board whose CURRENT firmware is halted/stale may not answer WHO AM I, yet it
-        # is still flashable by port. If exactly one changed board is unidentified and
-        # exactly one USB-serial port is unclaimed, pair them — unambiguous on a 2-board
-        # rig, and safe because any board that *did* answer is already claimed (so we
-        # can't misroute, e.g. flash FRONT firmware onto an identified DISPENSER).
+        # is still flashable by port. Pair it with the free port ONLY when that port is
+        # the board's saved (last-discovered) port — see _infer_unidentified. A silent
+        # board on any OTHER port is treated as factory-blank and left alone: the app's
+        # first-flash menu names it with a human in the loop.
         claimed = set(mapping.values())
         free_usb = [d for d in _list_serial_ports()
                     if _is_usb_serial(d) and d not in claimed]
         unidentified = [b for b in compiled if b not in mapping]
-        if len(unidentified) == 1 and len(free_usb) == 1:
-            mapping[unidentified[0]] = free_usb[0]
-            log.warning("%s did not answer WHO AM I; flashing it on the only free USB "
-                        "port %s (its firmware may be halted).",
-                        unidentified[0], free_usb[0])
+        pair = _infer_unidentified(unidentified, free_usb, _saved_ports())
+        if pair:
+            mapping[pair[0]] = pair[1]
+            log.warning("%s did not answer WHO AM I; flashing it on its saved port %s "
+                        "(its firmware may be halted).", pair[0], pair[1])
+        elif len(unidentified) == 1 and len(free_usb) == 1:
+            log.warning("%s did not answer WHO AM I and the free port %s is not its "
+                        "saved port — likely a factory-blank board. Leaving it for the "
+                        "app's first-flash menu.", unidentified[0], free_usb[0])
         state = _load_flash_state()
         for board in boards:
             tag = compiled.get(board)

@@ -105,12 +105,21 @@ def test_failed_flash_is_retried():
     print("PASS: failed flash is retried, then recorded on success")
 
 
+def _write_app_config(ports: dict):
+    """Write the app's discovery record (autocycler_config.json) the inference reads."""
+    import json
+    with open(os.path.join(launcher.APP_DIR, "autocycler_config.json"), "w") as f:
+        json.dump(ports, f)
+
+
 def test_unidentified_present_board_flashed_by_inference():
-    # A board whose old firmware is halted won't answer WHO AM I, but if it's the only
-    # unidentified changed board and there's exactly one free USB port, flash it there.
+    # A board whose old firmware is halted won't answer WHO AM I, but it is still on
+    # the port it was last DISCOVERED on -- the inference may flash it there, and only
+    # there (the saved-port match is what separates it from a factory-blank board).
     launcher._have_arduino_cli = lambda: True
     launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
     launcher._compile_board = lambda b: True
+    _write_app_config({"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"})
 
     # Make everything current, then bump only FRONT and have it NOT answer the probe.
     launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"}
@@ -127,7 +136,52 @@ def test_unidentified_present_board_flashed_by_inference():
     launcher.flash_boards(launcher.fetch_firmware_changes())
     assert flashed.get("FRONT_ASSEMBLY") == "/dev/ttyUSB1", flashed
     assert launcher.fetch_firmware_changes() == {}
-    print("PASS: unidentified-but-present board flashed by inference on the free port")
+    print("PASS: unidentified-but-present board flashed by inference on its saved port")
+
+
+def test_blank_board_never_flashed_by_inference():
+    """THE REPORTED BUG: plugging in a factory-blank ESP32 flashed it as FRONT_ASSEMBLY
+    with no menu -- the old inference paired 'one silent changed board' with 'one free
+    port' by pure elimination. A silent board on a port that is NOT the pending board's
+    saved port must be left alone for the app's first-flash menu."""
+    launcher._have_arduino_cli = lambda: True
+    launcher._compile_board = lambda b: True
+    flashed = {}
+    launcher._upload_board = lambda b, port: (flashed.__setitem__(b, port) or True)
+
+    # FRONT firmware pending; a blank board appears on a NEVER-SEEN port.
+    _write_app_config({"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"})
+    _REMOTE[launcher.FIRMWARE["FRONT_ASSEMBLY"]["url"]] = b"FRONT FW BLANK-TEST"
+    launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB2"]
+    launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0"}   # blank stays silent
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())
+    assert flashed == {}, f"blank board must not be flashed by inference: {flashed}"
+    assert "FRONT_ASSEMBLY" in launcher.fetch_firmware_changes(), \
+        "the pending flash must stay pending (retried once the real board appears)"
+
+    # And with NO saved config at all (brand-new install), same refusal.
+    os.remove(os.path.join(launcher.APP_DIR, "autocycler_config.json"))
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())
+    assert flashed == {}, flashed
+
+    # The pure gate, corner by corner.
+    infer = launcher._infer_unidentified
+    saved = {"FRONT_ASSEMBLY": "/dev/ttyUSB1"}
+    assert infer(["FRONT_ASSEMBLY"], ["/dev/ttyUSB1"], saved) == ("FRONT_ASSEMBLY", "/dev/ttyUSB1")
+    assert infer(["FRONT_ASSEMBLY"], ["/dev/ttyUSB2"], saved) is None   # blank on new port
+    assert infer(["FRONT_ASSEMBLY"], ["/dev/ttyUSB1"], {}) is None      # no record at all
+    assert infer(["FRONT_ASSEMBLY", "DISPENSER"], ["/dev/ttyUSB1"], saved) is None
+    assert infer([], ["/dev/ttyUSB1"], saved) is None
+
+    # Restore the config + FRONT firmware state for any later test.
+    _write_app_config({"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"})
+    launcher._list_serial_ports = lambda: ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+    launcher._probe_ports = lambda: {"DISPENSER": "/dev/ttyUSB0", "FRONT_ASSEMBLY": "/dev/ttyUSB1"}
+    _reset_flash_throttle()
+    launcher.flash_boards(launcher.fetch_firmware_changes())
+    print("PASS: a factory-blank board is never flashed by inference -- menu's job")
 
 
 class _SpyApp:
@@ -342,6 +396,7 @@ if __name__ == "__main__":
         test_only_changed_board_reflashes,
         test_failed_flash_is_retried,
         test_unidentified_present_board_flashed_by_inference,
+        test_blank_board_never_flashed_by_inference,
         test_self_update_noop_when_launcher_unchanged,
         test_self_update_rejects_unparseable_launcher,
         test_updates_deferred_while_cycle_series_running,

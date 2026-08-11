@@ -72,9 +72,13 @@ passwordless `sudo` (the Pi default).
 
 - **Board identity** is by `WHO AM I` → `IAM:<id>` at flash time (independent of the
   saved `autocycler_config.json`).
-- **Inference fallback:** if exactly one changed board is unidentified AND exactly one
-  USB-serial port is unclaimed, flash it there (a board whose old firmware is halted won't
-  answer `WHO AM I` but is still flashable by port; unambiguous on a 2-board rig).
+- **Inference fallback (saved-port gated):** if exactly one changed board is unidentified
+  AND exactly one USB-serial port is unclaimed AND that port is the board's saved port
+  from `autocycler_config.json`, flash it there (a halted board can't answer `WHO AM I`
+  but is still sitting on the port it was last discovered on). The saved-port match is
+  MANDATORY: pure elimination used to flash factory-blank boards as the pending board the
+  moment they were plugged in, bypassing the app's first-flash menu (pinned by
+  `test_blank_board_never_flashed_by_inference`).
 - **Missing boards:** if no USB serial is present it waits + writes `launcher_status.txt`
   without disturbing the app; a present-but-absent target board is deferred with a
   "waiting for <board>" note. A topology/backoff throttle avoids stopping the app every
